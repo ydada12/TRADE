@@ -1,0 +1,10 @@
+# 双轨交易信号监控与告警系统 —— 运行依赖
+# 安装：python -m pip install -r requirements.txt
+#
+# 注意：本项目【只读】行情数据 + 只发微信提醒，
+# 不包含、也不允许引入任何券商/交易所交易接口 SDK。
+
+requests>=2.31.0
+PyYAML>=6.0.1
+pandas>=2.0.0
+akshare>=1.12.0

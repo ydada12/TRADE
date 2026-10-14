@@ -1,0 +1,17 @@
+# 密钥与本地数据，绝不提交
+.env
+*.key
+
+# 个人实际配置（含品种/持仓/成本价）—— 模板 config.example.yaml 才进版本库
+config.yaml
+
+# 运行期产物
+logs/
+state/
+__pycache__/
+*.pyc
+STOP_MONITOR.flag
+
+# 编辑器
+.vscode/
+.idea/

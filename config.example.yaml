@@ -1,0 +1,262 @@
+# ============================================================
+#  双轨交易信号监控与告警系统 —— 配置模板
+#  复制为 config.yaml 后修改。所有可变参数都在这个文件里。
+#
+#  【只读监控 + 只发微信提醒】，不下单、不接任何交易接口。
+#  所有行情/经济数据均来自真实公开 API，绝不由大模型生成。
+# ============================================================
+
+app:
+  # 时区：所有对外展示的时间统一按此时区（北京时间）
+  timezone: "Asia/Shanghai"
+  # 主循环轮询间隔（秒）。300 = 5 分钟
+  poll_interval_seconds: 300
+  log_dir: "logs"
+  log_level: "INFO"          # DEBUG / INFO / WARNING / ERROR
+  state_file: "state/state.json"
+  # true = 只写日志不真正推送（首次调试建议 true）
+  dry_run: false
+
+# ---------- 大模型：只做「翻译成人话 + 三分支剧本」 ----------
+# 强制只用 DeepSeek，不混用其他模型
+llm:
+  enabled: true
+  provider: "deepseek"
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"          # 也可填 V4.1-Flash 档位对应的模型名
+  api_key_env: "DEEPSEEK_API_KEY" # 只从环境变量读，禁止写明文
+  temperature: 0.2
+  max_tokens: 800
+  timeout_seconds: 60
+  max_retries: 3
+  # 防编造：校验大模型输出里出现的数字是否都来自我们喂给它的真实数据
+  # 一旦发现数据里没有的数字，就丢弃大模型输出，改用确定性模板
+  guard_against_fabricated_numbers: true
+
+# ---------- 推送：Server酱 Turbo ----------
+notify:
+  provider: "serverchan"
+  endpoint: "https://sctapi.ftqq.com"
+  send_key_env: "SERVERCHAN_SENDKEY"
+  max_retries: 2                 # 失败重发 2 次
+  retry_backoff_seconds: 3
+  timeout_seconds: 20
+  # 去重冷却：同一信号在该时间内不重复轰炸（分钟）
+  cooldown_minutes: 240
+
+# ---------- 行情数据源 ----------
+market:
+  provider: "okx"
+  base_url: "https://www.okx.com"
+  timeout_seconds: 20
+  max_retries: 4                 # 断网/拉取失败自动重试
+  retry_backoff_seconds: 2
+  weekly_bar: "1W"
+  weekly_candle_limit: 300
+  # 用美股本土数据补历史时，OKX 实时价与美股周收盘价偏离超过该百分比就在告警里报警
+  # （实测两者日均价差约 0.2%，最大约 3.5%）
+  divergence_warn_pct: 3.0
+  # 美股本土历史数据源（公开只读，无需 key）
+  us_stock:
+    timeout_seconds: 30
+    max_retries: 4
+    retry_backoff_seconds: 2
+
+# ---------- 经济日历（真实 API，禁止大模型补数） ----------
+calendar:
+  provider: "akshare"            # akshare = 免费，无需 key
+  days_ahead: 7
+  # 只保留重要性 >= 该值的事件（akshare「重要性」字段：1/2/3）
+  min_importance: 2
+  # 只关注这些地区的事件（留空 = 不限地区）。
+  # 不设地区会把印度/德国等一大堆 CPI 全推进来刷屏。
+  regions:
+    - "美国"
+    - "欧元区"
+    - "中国"
+  # 关注的事件关键词（命中任一即纳入事件轨）
+  keywords:
+    - "非农"
+    - "CPI"
+    - "核心CPI"
+    - "PCE"
+    - "利率决议"
+    - "FOMC"
+    - "失业率"
+    - "初请失业金"
+    - "GDP"
+    - "EIA"
+    - "API原油库存"
+    - "鲍威尔"
+  # 可选：Polymarket 预测市场概率（作为「市场预期」的补充参考，不是替代）
+  polymarket:
+    enabled: false
+    base_url: "https://gamma-api.polymarket.com"
+    keywords: ["Fed", "rate cut", "CPI", "recession", "oil"]
+
+# ============================================================
+#  监控品种
+#  inst_id 必须是数据源上真实存在的代码，写错系统会报错而不是瞎猜
+# ============================================================
+symbols:
+  - name: "TQQQ 纳指三倍做多（OKX 永续）"
+    inst_id: "TQQQ-USDT-SWAP"
+    inst_type: "SWAP"
+    enabled: true
+    # ---- 周K历史来源 ----
+    #   okx      = 用 OKX 自己的周K（该合约 2026-06 才上线，只有 15 根，算不了 MA20/MA30）
+    #   us_stock = 用美股本土 TQQQ 周K（多年历史，能算 MA20/MA30）
+    #   实时价永远用 OKX 的真实价格，美股数据只用来补历史均线。
+    history_source: "us_stock"
+    us_symbol: "TQQQ"           # Yahoo/Stooq 上的美股代码
+    us_history_range: "5y"      # 拉多少年历史
+    divergence_warn_pct: 3.0    # OKX实时价 vs 美股周收盘 偏离超此值就在告警里警示
+    ma_periods: [20, 30]
+    cross_pairs: [[20, 30]]
+    levels:
+      source: "auto"            # auto = 由真实周K算法推导支撑/压力
+      lookback_weeks: 12        # 用最近多少周推导关键位
+      min_distance_pct: 1.5     # 离现价近于该百分比的候选位会被丢弃（防假突破刷屏）
+      manual_support: []        # 想手动覆盖就填数字，如 [78.5, 75.0]
+      manual_resistance: []
+    # ---- 你本人下单的数据（只有你能提供，系统不推导）----
+    position:
+      side: "long"              # long / short
+      entry_price: 100.0
+      margin_usdt: 100.0
+      leverage: 4
+      note: "4x 杠杆多单"
+
+  - name: "WTI 原油（OKX 永续）"
+    inst_id: "CL-USDT-SWAP"
+    inst_type: "SWAP"
+    enabled: true
+    ma_periods: [20, 30]
+    cross_pairs: [[20, 30]]
+    levels:
+      source: "auto"
+      lookback_weeks: 12
+      manual_support: []
+      manual_resistance: []
+    position:
+      side: null                # 没持仓就留空，系统不会瞎编
+      entry_price: null
+      margin_usdt: null
+      leverage: null
+      note: ""
+
+  - name: "ETH 以太坊（OKX 现货）"
+    inst_id: "ETH-USDT"
+    inst_type: "SPOT"
+    enabled: true
+    ma_periods: [20, 30]
+    cross_pairs: [[20, 30]]
+    levels:
+      source: "auto"
+      lookback_weeks: 12
+      manual_support: []
+      manual_resistance: []
+    position:
+      side: null
+      entry_price: null
+      margin_usdt: null
+      leverage: null
+      note: ""
+
+# ---------- 模块2：趋势轨（周线）----------
+trend:
+  rules:
+    price_vs_ma: true           # 价格站上/跌破均线
+    ma_cross: true              # 均线上穿/下穿
+  # 只在趋势状态【发生变化】时告警，状态没变不刷屏
+  only_alert_on_state_change: true
+  # 判定「站上/跌破」用了多少容差（百分比），避免贴着均线来回抖
+  break_tolerance_pct: 0.3
+  # 趋势状态机定义
+  #   bull  = 收盘 > 主均线 且 主均线向上
+  #   bear  = 收盘 < 主均线 且 主均线向下
+  #   range = 其他
+  primary_ma: "fast"            # 用哪条均线做主判定：fast / slow
+
+# ---------- 模块3：事件轨（三分支预案）----------
+event:
+  enabled: true
+  pre_alert_minutes: 180        # 公布前多久推送剧本
+  post_check_minutes: 20        # 公布后多久拉实际值对号入座
+  # 单轮最多推几条事件，防止某天事件扎堆时连环轰炸
+  max_events_per_run: 3
+  # 事件影响哪些品种（不填 = 全部启用品种）
+  watch_symbols: []
+  # 按事件类别把剧本挂到最相关的品种上（类别由关键词自动识别）
+  #   employment=就业 / inflation=通胀 / rates=利率 / oil_inventory=原油库存 / growth=增长
+  symbol_by_category:
+    employment: "TQQQ-USDT-SWAP"
+    inflation: "TQQQ-USDT-SWAP"
+    rates: "TQQQ-USDT-SWAP"
+    growth: "TQQQ-USDT-SWAP"
+    oil_inventory: "CL-USDT-SWAP"
+  default_symbol: "TQQQ-USDT-SWAP"
+  # 大模型生成剧本时的方向常识（可改，防止写反）
+  direction_common_sense: |
+    - 非农就业/CPI 强于预期 -> 美联储偏鹰 -> 利空黄金、利多美元、通常压制风险资产（纳指、加密）
+    - 非农就业/CPI 弱于预期 -> 降息预期升温 -> 利多黄金、利空美元、通常利好风险资产
+    - EIA/API 原油库存大幅增加 -> 利空油价；库存大幅下降 -> 利多油价
+    - 利率决议加息 -> 利空风险资产与黄金；降息 -> 利多
+    （以上仅为历史上的一般规律，不是必然结果，不得写成必涨/必跌）
+
+# ---------- 重点时段盘中波动监控 ----------
+# 补趋势轨的短板：周线状态变化太慢。
+# 实测 2026-10-12 12:00 → 10-13 11:00 北京，TQQQ 永续从 82.55 跌到 78.04（-5.46%），
+# 周线状态仍是 bull，趋势轨一声不吭 —— 这个模块就是补这个。
+session_watch:
+  enabled: true
+  # 重点时段（北京时间，跨零点也支持，如 20:00-04:00）
+  # weekdays 可选：[0,1,2,3,4] 表示只在周一到周五生效（0=周一）
+  windows:
+    - name: "美股全时段"
+      start: "20:00"
+      end: "04:00"          # 覆盖盘前 + 开盘 + 盘中 + 收盘，跨零点
+    - name: "午后监察"
+      start: "14:30"
+      end: "15:30"
+  # 时段内的轮询间隔（秒）—— 比平时的 poll_interval_seconds 快很多
+  poll_interval_seconds: 60
+  candle_bar: "5m"
+  candle_limit: 600
+  # 波动阈值：最近 N 分钟内涨跌幅超过 pct% 就告警（可配多条）
+  move_thresholds:
+    - {window_minutes: 30, pct: 0.7}     # 半小时 0.7%
+    - {window_minutes: 60, pct: 1.0}     # 一小时 1.0%
+    - {window_minutes: 240, pct: 1.5}    # 四小时 1.5%
+  # 相对「本时段开盘」的累计涨跌幅阈值
+  since_open_pct: 2.0
+  # 防刷屏：同一品种同一时段内，同一幅度档位在该冷却时间内不重复推送。
+  # 但幅度【升级到更高档位】时会立即再推一次（例如从 -1% 恶化到 -2%）。
+  cooldown_minutes: 30
+  # 幅度档位宽度（百分点）。1.0 表示 -1%~-2% 算同一档，-2%~-3% 算下一档。
+  magnitude_bucket_pct: 1.0
+
+# ---------- 告警文案风控 ----------
+risk_disclaimer: "以上为历史规律梳理，仅供参考，决策与风险自负"
+# 【建议动作】只允许出现这一句，严禁买卖措辞
+allowed_action_text: "建议人工查看/等待确认"
+# 出现这些词的输出直接拦截重写（严禁买卖建议）
+forbidden_words:
+  - "建议买入"
+  - "建议卖出"
+  - "建议加仓"
+  - "建议减仓"
+  - "建议抄底"
+  - "建议逃顶"
+  - "建议平仓"
+  - "建议开仓"
+  - "建议止损"
+  - "建议止盈"
+  - "建议重仓"
+  - "建议满仓"
+  - "必涨"
+  - "必跌"
+  - "一定会涨"
+  - "一定会跌"
+  - "稳赚"
+  - "无风险"
