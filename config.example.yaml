@@ -169,6 +169,67 @@ symbols:
       leverage: null
       note: ""
 
+  - name: "XAU 黄金（OKX 永续）"
+    inst_id: "XAU-USDT-SWAP"
+    inst_type: "SWAP"
+    enabled: true
+    ma_periods: [20, 30]
+    cross_pairs: [[20, 30]]
+    levels:
+      source: "auto"
+      lookback_weeks: 12
+      manual_support: []
+      manual_resistance: []
+    position:
+      side: null
+      entry_price: null
+      margin_usdt: null
+      leverage: null
+      note: ""
+
+  - name: "SPY 标普500（OKX 永续）"
+    inst_id: "SPY-USDT-SWAP"
+    inst_type: "SWAP"
+    enabled: true
+    # OKX 该合约只有 33 根周K，MA20/MA30 勉强够但很脆；用美股本土 SPY 长历史补均线。
+    # 实测 OKX 实时价与美股 SPY 收盘价差约 0.3%，跟踪良好。
+    history_source: "us_stock"
+    us_symbol: "SPY"
+    us_history_range: "5y"
+    divergence_warn_pct: 3.0
+    ma_periods: [20, 30]
+    cross_pairs: [[20, 30]]
+    levels:
+      source: "auto"
+      lookback_weeks: 12
+      manual_support: []
+      manual_resistance: []
+    position:
+      side: null
+      entry_price: null
+      margin_usdt: null
+      leverage: null
+      note: ""
+
+  - name: "UNITREE 宇树（OKX 永续）"
+    inst_id: "UNITREE-USDT-SWAP"
+    inst_type: "SWAP"
+    enabled: true
+    # 该合约上线很新，OKX 目前只有 9 根周K，算不了 MA20/MA30，故用短周期均线。
+    ma_periods: [5, 10]
+    cross_pairs: [[5, 10]]
+    levels:
+      source: "auto"
+      lookback_weeks: 9
+      manual_support: []
+      manual_resistance: []
+    position:
+      side: null
+      entry_price: null
+      margin_usdt: null
+      leverage: null
+      note: ""
+
 # ---------- 模块2：趋势轨（周线）----------
 trend:
   rules:

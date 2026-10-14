@@ -40,8 +40,8 @@ from src.alert import (
     fmt_num,
     now_utc8_str,
     render_position_line,
+    sanitize_for_push,
     short_symbol,
-    strip_markdown,
     zone_hint,
 )
 from src.config import PROJECT_ROOT, Config, load_config
@@ -245,7 +245,7 @@ class Monitor:
         前者说明这条信号刚推过，可以放心记为已处理；
         后者说明用户根本没收到，不能把状态记成已处理，否则这条信号永远丢了。
         """
-        body = strip_markdown(body)
+        body = sanitize_for_push(body)
         body = self.safety.ensure_disclaimer(body)
 
         cooldown = self.cooldown_minutes if cooldown_minutes is None else cooldown_minutes
@@ -1576,7 +1576,7 @@ def main(argv: list[str] | None = None) -> int:
             signal_type="测试",
             disclaimer=monitor.safety.disclaimer,
         )
-        ok = monitor.notifier.send(body.title(), strip_markdown(body.render())).ok
+        ok = monitor.notifier.send(body.title(), sanitize_for_push(body.render())).ok
         print("推送成功" if ok else "推送失败，请查看日志")
         return 0 if ok else 1
 

@@ -465,6 +465,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\register_autostart.p
 
 ### 看状态
 
+**最快的方法：双击项目根目录的 `check.bat`**，或执行：
+
+```powershell
+python tools\alive.py
+```
+
+它直接用大白话给你结论：
+
+```
+【结论】✓ 监控正在正常运行
+        最后一次心跳：2026-10-14 19:47:27（1.0 分钟前）
+
+--- 进程与计划任务 ---
+计划任务 DualTrackSignalMonitor : Running
+监控进程 (run.py --loop)       : pid 28728
+守护进程 (run_forever.ps1)     : pid 3128
+```
+
+> **重点：判断「在不在跑」看的是【日志心跳】，不是进程在不在。**
+> 进程可能被网络阻塞卡死，但心跳停了就是真的没在干活。
+> 所以 `alive.py` 会告诉你「最后一次心跳是几分钟前」——
+> 超过约 1.5 倍轮询间隔（平时 5 分钟、重点时段 1 分钟）就该警惕了。
+
+它还会检查两种容易出事的重复启动：多个监控进程 / 多个守护进程
+（重复会让你收到重复推送）。
+
+更详细的信息用：
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\status.ps1
 ```
@@ -507,6 +535,7 @@ Get-Content "logs\monitor-$(Get-Date -Format 'yyyy-MM-dd').log" -Tail 50 -Encodi
 
 ```powershell
 python run.py --check                 # 自检：配置、数据源、key、红线
+python tools\alive.py                 # 【最常用】它到底在不在跑？一行看结论
 python run.py --once                  # 跑一轮后退出
 python run.py --loop                  # 常驻循环（守护脚本内部用的就是它）
 python run.py --test-push             # 只测微信推送链路

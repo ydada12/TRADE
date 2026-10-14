@@ -371,23 +371,28 @@ def test_alert_layout() -> None:
         disclaimer="以上为历史规律梳理，仅供参考，决策与风险自负",
     )
     text = a.render()
-    lines = text.splitlines()
+    lines = [ln for ln in text.splitlines() if ln.strip()]
 
     check("短名从 inst_id 提取", a.short_name == "TQQQ", a.short_name)
-    check("第一行是品种", lines[0].startswith("【品种】"), lines[0])
-    check("第二行是发生了什么", lines[1].startswith("【发生了什么】"), lines[1])
-    check("第三行是时间", lines[2].startswith("【时间】"), lines[2])
-    check("第四行是当前位置", lines[3].startswith("【当前位置】"), lines[3])
-    check("第五行是压力位", lines[4].startswith("【压力位】"), lines[4])
-    check("第六行是支撑位", lines[5].startswith("【支撑位】"), lines[5])
-    check("第七行是当下该做什么", lines[6].startswith("【当下该做什么】"), lines[6])
-    check("风险提示在最后一行",
-          lines[-1].startswith("【风险提示】") and a.disclaimer in lines[-1], lines[-1])
-
-    check("压力位标注在上方", "上方" in lines[4], lines[4])
-    check("支撑位标注在下方", "下方" in lines[5], lines[5])
-    check("压力位距离计算正确", "2.97%" in lines[4], lines[4])
-    check("支撑位距离计算正确", "1.81%" in lines[5], lines[5])
+    check("段间用空行分隔（Server酱³ 换行要求）", "\n\n" in text, text)
+    check("首行是二级标题且含品种短名",
+          lines[0].startswith("## ") and "TQQQ" in lines[0], lines[0])
+    check("标题行带信号类型", "盘中波动" in lines[0], lines[0])
+    check("发生了什么用粗体突出", lines[1] == "**30 分钟内下跌 1.19%**", lines[1])
+    check("现价带 emoji 与粗体标签", "📊 **现价** 80.23" in text, text)
+    check("压力位标注在上方且距离正确",
+          "🔴 **压力位** 82.61（上方 2.97%）" in text, text)
+    check("支撑位标注在下方且距离正确",
+          "🟢 **支撑位** 78.78（下方 1.81%）" in text, text)
+    check("时间行以时钟 emoji 开头", any(ln.startswith("🕒 ") for ln in lines), lines)
+    check("当下该做什么是三级标题", "### ⚠️ 当下该做什么" in lines, lines)
+    check("建议动作粗体单独成段", "**建议人工查看/等待确认" in text, text)
+    check("AI 解读是三级标题", "### 🤖 AI 解读" in text, text)
+    check("风险提示在最后一行且用引用块弱化",
+          lines[-1].startswith("> 【风险提示】") and a.disclaimer in lines[-1], lines[-1])
+    check("正文不再出现旧式【标签】行首",
+          not any(ln.startswith("【品种】") or ln.startswith("【发生了什么】") for ln in lines),
+          lines)
 
     # 标题（微信通知栏只显示标题，必须自带品种+发生了什么+现价）
     title = a.title()

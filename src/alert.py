@@ -95,23 +95,39 @@ class Alert:
 
     # ---------- 正文 ----------
     def render(self) -> str:
-        lines = [
-            f"【品种】{self.symbol}",
-            f"【发生了什么】{self.what_happened}",
-            f"【时间】{self.time_text}",
-            f"【当前位置】{fmt_num(self.price)}",
-            f"【压力位】{self._level_line(self.resistance, above=True)}",
-            f"【支撑位】{self._level_line(self.support, above=False)}",
-            f"【当下该做什么】{self.action_text}",
-        ]
-        if self.signal_type:
-            lines.append(f"【信号类型】{self.signal_type}")
+        """按「先看什么 → 再看什么」排版的 Markdown 正文（Server酱 desp 支持 Markdown）。
+
+        层级：二级标题=哪条通知；粗体=发生了什么/当下该做什么；
+             emoji 承担颜色语义（🔴 压力 / 🟢 支撑 / ⚠️ 行动）；块级空行=换行；
+             --- 只用于切出「行动」与「风险提示」两段。
+        """
+        short = self.short_name or self.symbol
+        kind = self.signal_type or "监控提醒"
+        blocks: list[str] = [f"## 【{short}】{kind}", f"**{self.what_happened}**"]
+
+        numbers = [f"🔴 **压力位** {self._level_line(self.resistance, above=True)}",
+                   f"🟢 **支撑位** {self._level_line(self.support, above=False)}"]
+        if self.price is not None:
+            numbers.insert(0, f"📊 **现价** {fmt_num(self.price)}")
+        blocks.append("　｜　".join(numbers))
+        blocks.append(f"🕒 {self.time_text}")
+
+        blocks.append("---")
+        blocks.append("### ⚠️ 当下该做什么")
+        blocks.append(f"**{self.action_text}**")
+
         if self.ai_text:
-            lines.append(f"【AI解读】{self.ai_text}")
+            blocks.append("### 🤖 AI 解读")
+            blocks.append(self.ai_text)
+
         if self.extra_lines:
-            lines.extend(self.extra_lines)
-        lines.append(f"【风险提示】{self.disclaimer}")
-        return "\n".join(lines)
+            blocks.append("### 📋 细节")
+            blocks.extend(md_bullet(line) for line in self.extra_lines)
+
+        blocks.append("---")
+        blocks.append(f"> 【风险提示】{self.disclaimer}")
+        # 段间空行：Server酱³ 要求两个换行才是真正的换行
+        return "\n\n".join(blocks)
 
     def _level_line(self, level: float | None, above: bool) -> str:
         if level is None:
@@ -180,28 +196,35 @@ class EventAlert:
         return f"【{short}】{prefix}：{hint}"
 
     def render(self) -> str:
-        lines: list[str] = []
-        if self.symbol:
-            lines.append(f"【品种】{self.symbol}")
-        lines.append(f"【发生了什么】{self.happened}")
-        lines.append(f"【时间】{self.time_text}")
+        prefix = "事件预警" if self.stage == "pre" else "事件结果"
+        short = self.short_name or self.symbol or "事件"
+        blocks: list[str] = [f"## 【{short}】{prefix}", f"**{self.happened}**"]
+
+        numbers = [f"🔴 **压力位** {_level_line(self.resistance, self.price, above=True)}",
+                   f"🟢 **支撑位** {_level_line(self.support, self.price, above=False)}"]
         if self.price is not None:
-            lines.append(f"【当前位置】{fmt_num(self.price)}")
-        lines.append(f"【压力位】{_level_line(self.resistance, self.price, above=True)}")
-        lines.append(f"【支撑位】{_level_line(self.support, self.price, above=False)}")
-        lines.append(f"【当下该做什么】{self.action_text}")
-        lines.append(f"【信号类型】事件（{'公布前' if self.stage == 'pre' else '公布后'}）")
+            numbers.insert(0, f"📊 **现价** {fmt_num(self.price)}")
+        blocks.append("　｜　".join(numbers))
+        blocks.append(f"🕒 {self.time_text}")
+
+        blocks.append("---")
+        blocks.append("### ⚠️ 当下该做什么")
+        blocks.append(f"**{self.action_text}**")
+
+        blocks.append(f"📌 **信号类型** 事件（{'公布前' if self.stage == 'pre' else '公布后'}）")
         if self.stage == "pre":
-            lines.append(f"【市场预期】{self.forecast_text or '数据源未提供'}"
-                         f"　【前值】{self.previous_text or '数据源未提供'}")
-        lines.append("")
-        lines.append(self.body)
+            blocks.append(f"📈 **市场预期** {self.forecast_text or '数据源未提供'}"
+                          f"　｜　📉 **前值** {self.previous_text or '数据源未提供'}")
+
+        blocks.append("---")
+        blocks.append(self.body)
+
         if self.extra_lines:
-            lines.append("")
-            lines.extend(self.extra_lines)
-        lines.append("")
-        lines.append(f"【风险提示】{self.disclaimer}")
-        return "\n".join(lines)
+            blocks.extend(md_bullet(line) for line in self.extra_lines)
+
+        blocks.append("---")
+        blocks.append(f"> 【风险提示】{self.disclaimer}")
+        return "\n\n".join(blocks)
 
 
 def _level_line(level: float | None, price: float | None, above: bool) -> str:
@@ -314,9 +337,17 @@ def render_position_line(pnl: PositionPnl) -> str:
     )
 
 
-def strip_markdown(text: str) -> str:
-    """微信推送里 markdown 表现不稳定，去掉常见标记。"""
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
-    text = text.replace("`", "")
+def md_bullet(line: str) -> str:
+    """把内部统一的「【标签】内容」转成 Markdown 列表项：- **标签**：内容。
+
+    内部数据结构（含 extra_lines）保持【】写法不变，只在推送渲染时转成 Markdown。
+    """
+    text = re.sub(r"【([^】]+)】", r"**\1**：", (line or "").strip())
+    return f"- {text}" if text else "-"
+
+
+def sanitize_for_push(text: str) -> str:
+    """微信通道不支持 HTML：剥掉原始 HTML 标签，并压缩多余空行，保留 Markdown。"""
+    text = re.sub(r"<[^>]+>", "", text or "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
