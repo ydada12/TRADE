@@ -223,6 +223,27 @@ def decide_alert(
     return GateDecision(True, "冷却已过，仍在持续", bucket)
 
 
+_MISSING = object()
+
+
+def record_for_window(record: dict[str, Any] | None,
+                      window_start_ts: int | None) -> dict[str, Any]:
+    """防刷屏记录只在【同一次时段开启】内有效，换了一次时段就当作没有记录。
+
+    为什么需要：状态 key 是「品种|时段名」，每天都一样。如果不按时段实例区分，
+    昨天晚上跌到 3 档会让今天 1~2 档的下跌全部被判成「幅度回落，不打扰」，
+    直到跌破 3 档才会再响。
+
+    window_start_ts：该时段本次开启时刻的秒级时间戳；手动不限时段的测试传 None。
+    没有 window_start_ts 字段的旧记录（修复前写入的）一律视为过期，自动清掉。
+    """
+    if not record:
+        return {}
+    if record.get("window_start_ts", _MISSING) != window_start_ts:
+        return {}
+    return record
+
+
 def render_fallback_text(symbol_name: str, window_label: str,
                          hits: list[dict[str, Any]],
                          levels: dict[str, Any] | None) -> str:

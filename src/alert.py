@@ -20,6 +20,7 @@ UTC8 = timezone(timedelta(hours=8))
 
 SIGNAL_TREND = "趋势"
 SIGNAL_EVENT = "事件"
+SIGNAL_SHORT = "做空观察位"
 
 
 def fmt_num(value: Any, digits: int | None = None) -> str:

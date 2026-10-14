@@ -34,11 +34,13 @@ class HttpClient:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
 
-    def _sleep(self, attempt: int) -> None:
+    def _delay(self, attempt: int) -> float:
         # 指数退避 + 抖动，避免被风控打成高频
         delay = self.backoff * (2 ** (attempt - 1))
-        delay = min(delay, 30.0) * (0.7 + random.random() * 0.6)
-        time.sleep(delay)
+        return min(delay, 30.0) * (0.7 + random.random() * 0.6)
+
+    def _sleep(self, attempt: int) -> None:
+        time.sleep(self._delay(attempt))
 
     def request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         kwargs.setdefault("timeout", self.timeout)
@@ -53,11 +55,12 @@ class HttpClient:
             except (requests.RequestException, HttpError) as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
+                    delay = self._delay(attempt)
                     log.warning(
                         "请求失败(%s/%s) %s %s -> %s，%.1fs 后重试",
-                        attempt, self.max_retries, method, url, exc, 0,
+                        attempt, self.max_retries, method, url, exc, delay,
                     )
-                    self._sleep(attempt)
+                    time.sleep(delay)
                 else:
                     log.error("请求最终失败(%s/%s) %s %s -> %s", attempt, self.max_retries, method, url, exc)
         raise HttpError(f"请求失败，已重试 {self.max_retries} 次：{method} {url} -> {last_exc}")

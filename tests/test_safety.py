@@ -7,15 +7,25 @@
 from __future__ import annotations
 
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.alert import SafetyFilter, compute_position_pnl, fmt_num
-from src.datasource.okx import Candle
+from src.alert import SIGNAL_SHORT, SafetyFilter, compute_position_pnl, fmt_num
+from src.datasource.okx import BookLevel, Candle, OrderBook, Ticker, Trade
 from src.llm.deepseek import find_fabricated_numbers
 from src.modules.event import determine_branch, render_fallback_script
+from src.modules.levels import derive_intraday_levels
+from src.modules.short_signal import (
+    OrderflowMetrics,
+    compute_orderflow_metrics,
+    score_short_signal,
+)
 from src.modules.trend import evaluate_trend
+
+BJ = timezone(timedelta(hours=8))
 
 PASSED = 0
 FAILED = 0
@@ -405,6 +415,403 @@ def test_alert_layout() -> None:
     check("无关键位时如实标注", "数据源未提供" in b.render(), b.render())
 
 
+# ---------------------------------------------------------------- 回归：盘中档位跨天重置
+def test_session_window_reset() -> None:
+    print("\n[回归] 盘中防刷屏记录按「时段的某一次开启」重置")
+    from src.modules.session import decide_alert, record_for_window
+
+    day1 = 1_800_000_000
+    day2 = day1 + 86400
+    rec = {"last_ts": day1 + 3600, "last_bucket": 3, "window_start_ts": day1}
+
+    check("同一次时段内记录保留", record_for_window(rec, day1) is rec)
+    check("换了一天（时段重新开启）记录清零", record_for_window(rec, day2) == {})
+    legacy = {"last_ts": day1 + 3600, "last_bucket": 3}          # 修复前写入的旧记录
+    check("没有 window_start_ts 的旧记录视为过期", record_for_window(legacy, day2) == {})
+    check("空记录返回空字典", record_for_window(None, day1) == {})
+    manual = {"last_ts": 1.0, "last_bucket": 1, "window_start_ts": None}
+    check("手动不限时段(None)的记录在手动模式下保留", record_for_window(manual, None) is manual)
+
+    # 复现原 bug：昨天 3 档，今天 -1.3% 被「幅度回落」吞掉
+    stale = decide_alert(1.3, rec["last_ts"], rec["last_bucket"], day2 + 3600, 30.0, 1.0)
+    check("（旧行为）昨天3档会压住今天1档 -> 被吞", not stale.alert, stale.reason)
+    fixed_rec = record_for_window(rec, day2)
+    fixed = decide_alert(1.3, fixed_rec.get("last_ts"), int(fixed_rec.get("last_bucket", -1)),
+                         day2 + 3600, 30.0, 1.0)
+    check("（修复后）今天重新开始计档位 -> 首次触发告警", fixed.alert and "首次" in fixed.reason,
+          fixed.reason)
+
+
+# ---------------------------------------------------------------- 回归：推送失败不丢信号
+def _make_monitor(tmp_dir: Path):
+    """用示例配置造一个 Monitor，状态/日志都落在临时目录，不碰真实 state。"""
+    import logging
+
+    from run import Monitor
+    from src.config import load_config
+
+    cfg = load_config()
+    cfg._data["app"]["state_file"] = str(tmp_dir / "state.json")
+    cfg._data["app"]["log_dir"] = str(tmp_dir / "logs")
+    monitor = Monitor(cfg, dry_run=False)
+    # Windows 下未释放的日志文件句柄会让 TemporaryDirectory 清理失败（WinError 32）。
+    # 测试不校验日志文件内容，这里关掉文件 handler，只留控制台输出。
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if isinstance(handler, logging.FileHandler):
+            root.removeHandler(handler)
+            handler.close()
+    monitor.llm.translate = lambda sp, um, facts, fallback: (fallback, "template")
+    return monitor
+
+
+def test_push_failure_not_lost() -> None:
+    print("\n[回归] 推送失败时不落状态，下一轮重试；成功后才记已发")
+    import tempfile
+    import time
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+
+    from run import MAX_PUSH_RETRIES
+    from src.datasource.econ_calendar import BEIJING, EconEvent
+    from src.datasource.okx import Ticker
+    from src.modules.levels import Levels
+
+    levels_dict = Levels("TQQQ-USDT-SWAP", 80.0, supports=[78.0], resistances=[82.0]).as_dict()
+
+    # ---------- 事件轨 ----------
+    with tempfile.TemporaryDirectory() as td:
+        m = _make_monitor(Path(td))
+        pub = datetime.now(BEIJING) + timedelta(minutes=60)
+        event = EconEvent(date=pub.strftime("%Y-%m-%d"), time=pub.strftime("%H:%M"),
+                          region="美国", name="美国9月CPI年率", forecast=3.7,
+                          previous=3.5, importance=3)
+        fp = f"event|{event.fingerprint}"
+        m.calendar.fetch_range = lambda *a, **k: [event]
+        m._symbol_levels = lambda symbol: (levels_dict, 80.0, "2026-10-14 00:00:00")
+
+        sent: list[str] = []
+        net = {"down": True}
+
+        def fake_send(title, body):
+            sent.append(title)
+            return SimpleNamespace(ok=not net["down"], detail="boom")
+
+        m.notifier.send = fake_send
+
+        m.run_events()
+        rec = m.state.get_event(fp) or {}
+        check("事件预警推送失败 -> 不标记 pre_sent", not rec.get("pre_sent"), str(rec))
+        m.run_events()
+        check("失败后下一轮会重试（又尝试发送了一次）", len(sent) == 2, str(len(sent)))
+
+        net["down"] = False
+        m.run_events()
+        rec = m.state.get_event(fp) or {}
+        check("网络恢复后补发成功 -> 标记 pre_sent", rec.get("pre_sent") is True, str(rec))
+        n_after = len(sent)
+        m.run_events()
+        check("已发过不再重复发", len(sent) == n_after, f"{len(sent)} vs {n_after}")
+
+    with tempfile.TemporaryDirectory() as td:
+        m = _make_monitor(Path(td))
+        m.calendar.fetch_range = lambda *a, **k: [event]
+        m._symbol_levels = lambda symbol: (levels_dict, 80.0, "ts")
+        sent2: list[str] = []
+        m.notifier.send = lambda t, b: (sent2.append(t),
+                                        SimpleNamespace(ok=False, detail="down"))[1]
+        for _ in range(MAX_PUSH_RETRIES + 3):
+            m.run_events()
+        check(f"长期故障最多尝试 {MAX_PUSH_RETRIES} 次后放弃，不无限重试",
+              len(sent2) == MAX_PUSH_RETRIES, str(len(sent2)))
+
+    # ---------- 趋势轨 ----------
+    with tempfile.TemporaryDirectory() as td:
+        m = _make_monitor(Path(td))
+        week = 7 * 86400 * 1000
+        base = 1_700_000_000_000
+        candles = [Candle(ts_ms=base + i * week, open=100 + i, high=101 + i, low=99 + i,
+                          close=100 + i, volume=1.0, confirmed=True) for i in range(30)]
+        inst = "TQQQ-USDT-SWAP"
+        m.okx.get_instrument = lambda *a, **k: {"instId": inst}
+        m.okx.get_ticker = lambda i: Ticker(i, 131.0, 0, 0, 0, 0, int(time.time() * 1000))
+        m._weekly_candles = lambda symbol: (candles, "测试数据")
+        m.state.set_trend_state(inst, {"state": "range"})
+
+        sent3: list[str] = []
+        net3 = {"down": True}
+        m.notifier.send = lambda t, b: (sent3.append(t),
+                                        SimpleNamespace(ok=not net3["down"], detail="x"))[1]
+
+        m.run_trend(only=inst)
+        check("趋势切换推送失败 -> 状态仍停在旧状态(range)",
+              (m.state.get_trend_state(inst) or {}).get("state") == "range",
+              str(m.state.get_trend_state(inst)))
+        net3["down"] = False
+        m.run_trend(only=inst)
+        check("恢复后重试成功 -> 状态更新为 bull 并已推送",
+              (m.state.get_trend_state(inst) or {}).get("state") == "bull" and len(sent3) == 2,
+              f"{m.state.get_trend_state(inst)} sent={len(sent3)}")
+        m.run_trend(only=inst)
+        check("状态不再变化 -> 不重复推送", len(sent3) == 2, str(len(sent3)))
+
+    # ---------- 重试计数持久化与清理 ----------
+    from src.state import StateStore
+    with tempfile.TemporaryDirectory() as td:
+        store = StateStore(Path(td) / "s.json")
+        check("重试计数从 1 开始累加", store.bump_retry("k") == 1 and store.bump_retry("k") == 2)
+        store.clear_retry("k")
+        check("清除后重新计数", store.bump_retry("k") == 1)
+        store.save()
+        again = StateStore(Path(td) / "s.json")
+        check("重试计数能落盘并读回", again.bump_retry("k") == 2)
+        store._data["retries"]["old"] = {"n": 9, "at": time.time() - 8 * 86400}
+        store.bump_retry("other")
+        check("7 天前的旧重试记录被清理", "old" not in store._data["retries"])
+
+
+# ---------------------------------------------------------------- 回归：缓存
+def test_caching() -> None:
+    print("\n[回归] 周K / 日历 / instrument 缓存")
+    import tempfile
+    import time
+    from datetime import datetime, timedelta
+
+    from src.datasource.econ_calendar import BEIJING, EconEvent
+
+    with tempfile.TemporaryDirectory() as td:
+        m = _make_monitor(Path(td))
+
+        # ---- 周K ----
+        symbol = {"inst_id": "X-USDT-SWAP"}
+        calls = {"n": 0, "fail": False}
+
+        def fake_fetch(sym):
+            calls["n"] += 1
+            if calls["fail"]:
+                raise RuntimeError("yahoo down")
+            return [], "desc"
+
+        m._fetch_weekly_candles = fake_fetch
+        m._weekly_candles(symbol)
+        m._weekly_candles(symbol)
+        check("周K缓存期内只真实拉取一次", calls["n"] == 1, str(calls["n"]))
+
+        ts, c, d = m._weekly_cache["X-USDT-SWAP"]
+        m._weekly_cache["X-USDT-SWAP"] = (ts - m.weekly_cache_seconds - 1, c, d)
+        m._weekly_candles(symbol)
+        check("缓存过期后重新拉取", calls["n"] == 2, str(calls["n"]))
+
+        calls["fail"] = True
+        ts, c, d = m._weekly_cache["X-USDT-SWAP"]
+        m._weekly_cache["X-USDT-SWAP"] = (ts - m.weekly_cache_seconds - 1, c, d)
+        try:
+            m._weekly_candles(symbol)
+            check("刷新失败时回退到不太旧的缓存", True)
+        except Exception as exc:
+            check("刷新失败时回退到不太旧的缓存", False, str(exc))
+        m._weekly_cache["X-USDT-SWAP"] = (time.time() - 7 * 3600, c, d)
+        try:
+            m._weekly_candles(symbol)
+            check("缓存超过 6 小时且刷新失败 -> 如实报错", False, "没有抛异常")
+        except RuntimeError:
+            check("缓存超过 6 小时且刷新失败 -> 如实报错", True)
+
+        # ---- 日历 ----
+        now = datetime.now(BEIJING)
+        far = now + timedelta(hours=30)
+        near = now + timedelta(minutes=2)
+
+        def mk(pub, name="美国9月CPI年率"):
+            return EconEvent(date=pub.strftime("%Y-%m-%d"), time=pub.strftime("%H:%M"),
+                             region="美国", name=name, forecast=3.7, previous=3.5, importance=3)
+
+        cal = {"n": 0, "events": [mk(far)], "fail": False}
+
+        def fake_cal(*a, **k):
+            cal["n"] += 1
+            if cal["fail"]:
+                raise RuntimeError("baidu 403")
+            return cal["events"]
+
+        m.calendar.fetch_range = fake_cal
+        m._calendar_events(now)
+        m._calendar_events(now)
+        check("日历缓存期内只抓取一次（原来每轮抓 7 天）", cal["n"] == 1, str(cal["n"]))
+
+        m._calendar_cache = (time.time() - 4 * 60, m._calendar_cache[1])
+        m._calendar_events(now)
+        check("无临近事件时 4 分钟的缓存仍有效", cal["n"] == 1, str(cal["n"]))
+
+        cal["events"] = [mk(near)]
+        m._calendar_cache = (time.time() - 31 * 60, [mk(far)])
+        m._calendar_events(now)
+        check("缓存超过 30 分钟 -> 刷新", cal["n"] == 2, str(cal["n"]))
+        m._calendar_cache = (time.time() - 4 * 60, [mk(near)])
+        m._calendar_events(now)
+        check("有事件 2 分钟后公布 -> 缩短缓存，4 分钟的缓存要刷新", cal["n"] == 3, str(cal["n"]))
+
+        m._calendar_events(now, fresh=True)
+        check("fresh=True（手动 --force）绕过缓存", cal["n"] == 4, str(cal["n"]))
+
+        cal["fail"] = True
+        m._calendar_cache = (time.time() - 31 * 60, [mk(far)])
+        got = m._calendar_events(now)
+        check("日历刷新失败时沿用旧缓存而不是丢掉整轮", len(got) == 1 and got[0].name.startswith("美国"))
+
+        # ---- instrument ----
+        api = {"n": 0, "rows": [{"instId": "X"}]}
+
+        def fake_api(path, params):
+            api["n"] += 1
+            return api["rows"]
+
+        m.okx._api = fake_api
+        m.okx.get_instrument("X-USDT-SWAP", "SWAP")
+        m.okx.get_instrument("X-USDT-SWAP", "SWAP")
+        check("存在的合约缓存，只请求一次", api["n"] == 1, str(api["n"]))
+        api["rows"] = []
+        api["n"] = 0
+        m.okx.get_instrument("NOPE-USDT-SWAP", "SWAP")
+        m.okx.get_instrument("NOPE-USDT-SWAP", "SWAP")
+        check("不存在的合约不缓存，每次都如实报告", api["n"] == 2, str(api["n"]))
+
+    from src.http_util import HttpClient
+    delay = HttpClient(backoff=2.0)._delay(1)
+    check("重试日志用的退避时长真实可用（1.4~2.6s）", 1.3 < delay < 2.7, str(delay))
+
+
+def _mk_candle(bj: datetime, o: float, h: float, l: float, c: float, v: float) -> Candle:
+    return Candle(ts_ms=int(bj.timestamp() * 1000), open=o, high=h, low=l, close=c,
+                  volume=v, confirmed=True)
+
+
+# ---------------------------------------------------------------- 做空观察位
+def test_intraday_levels() -> None:
+    print("\n[做空] 日内关键位（前日高 / 当日高 / VWAP）")
+    day1 = datetime(2026, 10, 13, 10, 0, tzinfo=BJ)
+    day2 = datetime(2026, 10, 14, 10, 0, tzinfo=BJ)
+    candles = [
+        _mk_candle(day1, 100, 110, 95, 105, 10),
+        _mk_candle(day1 + timedelta(hours=4), 105, 112, 100, 108, 30),
+        _mk_candle(day2, 108, 115, 105, 110, 20),
+        _mk_candle(day2 + timedelta(hours=4), 110, 118, 109, 117, 20),
+    ]
+    lv = derive_intraday_levels("X-USDT-SWAP", candles, 117.0)
+    check("前日高点取自前一日", lv.prev_day_high == 112, str(lv.prev_day_high))
+    check("当日高点取自当日", lv.day_high == 118, str(lv.day_high))
+    check("当日低点取自当日", lv.day_low == 105, str(lv.day_low))
+    expected_vwap = ((115 + 105 + 110) / 3 * 20 + (118 + 109 + 117) / 3 * 20) / 40
+    check("VWAP 为典型价按量加权", lv.vwap is not None and abs(lv.vwap - expected_vwap) < 0.01,
+          str(lv.vwap))
+    check("现价下方最近压力=当日高", lv.nearest_resistance() == 118, str(lv.nearest_resistance()))
+    lv2 = derive_intraday_levels("X-USDT-SWAP", candles, 119.0)
+    check("现价高于所有候选时取最高候选", lv2.nearest_resistance() == 118,
+          str(lv2.nearest_resistance()))
+    empty = derive_intraday_levels("X-USDT-SWAP", [], 100.0)
+    check("空K线不臆测（返回空位）",
+          empty.day_high is None and empty.nearest_resistance() is None)
+
+
+def test_orderflow_metrics() -> None:
+    print("\n[做空] 盘口卖压指标（只读盘口 + 逐笔）")
+    now_ms = int(time.time() * 1000)
+    book = OrderBook(
+        inst_id="X",
+        bids=[BookLevel(100.0, 1.0), BookLevel(99.0, 1.0)],
+        asks=[BookLevel(101.0, 1.0), BookLevel(105.0, 10.0), BookLevel(106.0, 1.0)],
+        ts_ms=now_ms,
+    )
+    trades = [Trade(0, 101.0, 1.0, "sell"), Trade(0, 101.0, 1.0, "buy"),
+              Trade(0, 101.0, 2.0, "sell")]
+    m = compute_orderflow_metrics(book, trades, 100.0, 105.0, now_ms=now_ms)
+    check("买卖量失衡为负（卖压）",
+          m.imbalance is not None and abs(m.imbalance + 0.7143) < 0.001, str(m.imbalance))
+    check("主动卖出占比 3/4=0.75",
+          m.taker_sell_ratio is not None and abs(m.taker_sell_ratio - 0.75) < 1e-9,
+          str(m.taker_sell_ratio))
+    check("识别压力位附近卖墙（10 倍）",
+          m.sell_wall_price == 105.0 and m.sell_wall_ratio == 10.0,
+          f"{m.sell_wall_price}/{m.sell_wall_ratio}")
+    check("盘口数据可用", m.usable())
+    empty = compute_orderflow_metrics(None, [], 100.0, None)
+    check("无盘口/逐笔时 usable=False 且不硬算",
+          not empty.usable() and empty.imbalance is None and empty.taker_sell_ratio is None)
+
+
+def test_short_scoring() -> None:
+    print("\n[做空] 打分纯函数 score_short_signal")
+    strong = OrderflowMetrics(
+        imbalance=-0.4, taker_sell_ratio=0.7, sell_wall_price=105.0, sell_wall_ratio=3.0,
+        trade_count=50, depth_levels=100, book_age_ms=500,
+    )
+    d = score_short_signal(100.0, 100.5, 100.8, strong, "range", pressure_persist=True)
+    check("触及+回落+卖压 -> 告警", d.alert and d.score >= 4, str(d.as_dict()))
+    check("观察位=日内压力位", d.observation_level == 100.5, str(d.observation_level))
+    check("失效位=压力位上方 1%", abs(d.invalidation_level - 100.5 * 1.01) < 1e-9,
+          str(d.invalidation_level))
+    check("观察区距现价%（+0.50%）", d.distance_pct is not None and abs(d.distance_pct - 0.5) < 1e-6,
+          str(d.distance_pct))
+    check("失效位距现价%（+1.505%）",
+          d.invalidation_distance_pct is not None and abs(d.invalidation_distance_pct - 1.505) < 1e-6,
+          str(d.invalidation_distance_pct))
+
+    bull = score_short_signal(100.0, 100.5, 100.8, strong, "bull", pressure_persist=True)
+    check("周线多头：逆势扣分 2", bull.score == d.score - 2, f"{bull.score} vs {d.score}")
+
+    far = score_short_signal(90.0, 100.5, 100.6, strong, "range")
+    check("远离压力位 -> 不告警", not far.alert, str(far.as_dict()))
+
+    neutral = OrderflowMetrics(
+        imbalance=0.1, taker_sell_ratio=0.4, sell_wall_price=None, sell_wall_ratio=None,
+        trade_count=10, depth_levels=20, book_age_ms=200,
+    )
+    mid = score_short_signal(100.0, 100.5, 100.1, neutral, "range")
+    check("无卖压、无拒绝 -> 分低不告警", not mid.alert, str(mid.as_dict()))
+
+    no_res = score_short_signal(100.0, None, None, strong, "range")
+    check("缺压力位 -> data_ok=False 不告警", not no_res.alert and not no_res.data_ok)
+    no_of = score_short_signal(100.0, 100.5, 100.8, None, "range")
+    check("缺盘口 -> data_ok=False 不告警", not no_of.alert and not no_of.data_ok)
+
+
+def test_short_alert_wording() -> None:
+    print("\n[做空] 推送文案：只说「失效位」，不碰红线")
+    import tempfile
+
+    now_ms = int(time.time() * 1000)
+    with tempfile.TemporaryDirectory() as td:
+        m = _make_monitor(Path(td))
+        symbol = {"inst_id": "TQQQ-USDT-SWAP", "name": "TQQQ", "inst_type": "SWAP"}
+        ticker = Ticker("TQQQ-USDT-SWAP", 100.0, 98.0, 101.0, 97.0, 1000.0, now_ms)
+        day1 = datetime(2026, 10, 13, 10, 0, tzinfo=BJ)
+        day2 = datetime(2026, 10, 14, 10, 0, tzinfo=BJ)
+        candles = [
+            _mk_candle(day1, 100, 110, 95, 105, 10),
+            _mk_candle(day2, 108, 100.8, 99.0, 100.0, 20),
+        ]
+        intraday = derive_intraday_levels("TQQQ-USDT-SWAP", candles, 100.0)
+        book = OrderBook(
+            "TQQQ-USDT-SWAP",
+            bids=[BookLevel(99.9, 1.0)],
+            asks=[BookLevel(100.5, 8.0), BookLevel(100.6, 1.0)],
+            ts_ms=now_ms,
+        )
+        trades = [Trade(0, 100.0, 1.0, "sell"), Trade(0, 100.0, 1.0, "buy")]
+        metrics = compute_orderflow_metrics(book, trades, 100.0, 100.5, now_ms=now_ms)
+        decision = score_short_signal(100.0, 100.5, 100.6, metrics, "bull")
+        body = m._build_short_alert(symbol, ticker, intraday, metrics, decision,
+                                    "美盘(21:30-04:00)", "bull")
+        text = body.render()
+        check("标题含「做空观察位」", "做空观察位" in body.title(), body.title())
+        check("正文含「失效位」", "失效位" in text)
+        check("正文含距现价百分比", "距现价" in text)
+        check("信号类型正确", SIGNAL_SHORT in text)
+        check("不含「止损」字样", "止损" not in text)
+        check("不含「开仓」字样", "开仓" not in text)
+        check("红线过滤器无违规", m.safety.violations(text) == [], str(m.safety.violations(text)))
+
+
 def main() -> int:
     print("=" * 66)
     print("双轨信号监控系统 —— 安全自测")
@@ -418,6 +825,13 @@ def main() -> int:
     test_position_pnl()
     test_levels()
     test_session_watch()
+    test_session_window_reset()
+    test_push_failure_not_lost()
+    test_caching()
+    test_intraday_levels()
+    test_orderflow_metrics()
+    test_short_scoring()
+    test_short_alert_wording()
     test_alert_layout()
     test_formatting()
     print("\n" + "=" * 66)

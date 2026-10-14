@@ -25,6 +25,7 @@ class StateStore:
             "sent": {},
             "events": {},
             "session": {},
+            "retries": {},
         }
         self.load()
 
@@ -87,6 +88,22 @@ class StateStore:
 
     def set_event(self, fingerprint: str, info: dict[str, Any]) -> None:
         self._data["events"][fingerprint] = info
+
+    # ---------- 推送失败重试计数 ----------
+    def bump_retry(self, key: str) -> int:
+        """记一次推送失败，返回该 key 累计失败次数。顺手清理 7 天前的旧记录。"""
+        retries = self._data.setdefault("retries", {})
+        now = time.time()
+        cutoff = now - 7 * 86400
+        for stale in [k for k, v in retries.items()
+                      if not isinstance(v, dict) or float(v.get("at", 0)) < cutoff]:
+            retries.pop(stale, None)
+        count = int((retries.get(key) or {}).get("n", 0)) + 1
+        retries[key] = {"n": count, "at": now}
+        return count
+
+    def clear_retry(self, key: str) -> None:
+        self._data.setdefault("retries", {}).pop(key, None)
 
     # ---------- 盘中监控记忆（防刷屏用）----------
     def get_session(self, key: str) -> dict[str, Any] | None:

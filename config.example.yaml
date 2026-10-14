@@ -53,6 +53,8 @@ market:
   retry_backoff_seconds: 2
   weekly_bar: "1W"
   weekly_candle_limit: 300
+  # 周K缓存（分钟）。周K一周才收一根，重点时段 60 秒一轮时不缓存会反复重拉 Yahoo/OKX
+  weekly_cache_minutes: 30
   # 用美股本土数据补历史时，OKX 实时价与美股周收盘价偏离超过该百分比就在告警里报警
   # （实测两者日均价差约 0.2%，最大约 3.5%）
   divergence_warn_pct: 3.0
@@ -66,6 +68,10 @@ market:
 calendar:
   provider: "akshare"            # akshare = 免费，无需 key
   days_ahead: 7
+  # 日历缓存（分钟）。平时 cache_minutes 刷新一次；有关注事件即将公布/刚公布时
+  # 改用 hot_cache_minutes，才能尽快拿到实际值。避免每分钟抓 7 天触发百度 403 限流。
+  cache_minutes: 30
+  hot_cache_minutes: 3
   # 只保留重要性 >= 该值的事件（akshare「重要性」字段：1/2/3）
   min_importance: 2
   # 只关注这些地区的事件（留空 = 不限地区）。
@@ -235,6 +241,32 @@ session_watch:
   cooldown_minutes: 30
   # 幅度档位宽度（百分点）。1.0 表示 -1%~-2% 算同一档，-2%~-3% 算下一档。
   magnitude_bucket_pct: 1.0
+
+# ---------- 做空观察位（只提醒，不下单）----------
+# 周线关键位刻意丢掉贴近现价的位置，但做空要盯的恰是「贴着现价的压力」：
+# 前日高 / 当日高 / VWAP + OKX 盘口（/market/books）与逐笔成交（/market/trades）。
+# 只产出「观察区 / 失效位」这类客观描述，不给开仓指令、不给止损指令。
+short_watch:
+  enabled: true
+  # 只在这些时段内评估；留空 = 复用上面的 session_watch.windows
+  windows: []
+  # 只监控这些品种（inst_id）；留空 = 全部启用品种
+  symbols: []
+  candle_bar: "5m"             # 日内关键位用的 K 线周期
+  candle_limit: 300            # 5m × 300 ≈ 覆盖最近 24 小时，够算当日/前日
+  book_depth: 50               # 盘口档位数
+  trades_limit: 100            # 逐笔成交条数
+  book_top_levels: 10          # 算买卖失衡用前几档
+  resistance_max_pct: 3.0      # 日内压力候选与现价偏离超过该百分比就不选它
+  touch_pct: 0.5               # 现价距压力位在这个百分比内算「触及」
+  pullback_pct: 0.2            # 触及后回落超过该百分比才算「被拒绝」
+  invalidation_pct: 1.0        # 失效位 = 压力位上方该百分比处
+  imbalance_threshold: -0.2    # 买卖量失衡低于该值算卖压（负=卖压）
+  taker_sell_ratio_threshold: 0.55  # 主动卖出占比高于该值算卖压
+  wall_ratio_threshold: 2.0    # 压力位附近挂单量超过同侧中位数该倍数算「卖墙」
+  counter_trend_penalty: 2     # 周线多头时逆势观察扣分
+  score_threshold: 4           # 打分达到该值才推送
+  cooldown_minutes: 180        # 同一观察区在该时间内不重复推
 
 # ---------- 告警文案风控 ----------
 risk_disclaimer: "以上为历史规律梳理，仅供参考，决策与风险自负"

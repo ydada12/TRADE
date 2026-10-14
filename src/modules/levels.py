@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import date, timedelta, timezone
 
 from ..datasource.okx import Candle
 
 log = logging.getLogger(__name__)
+
+BEIJING = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -152,3 +155,95 @@ def detect_level_breaks(
             "text": f"上破压力位 {resistance:g}（现价 {current_price:g}）",
         })
     return breaks
+
+
+# ---------------------------------------------------------------------------
+# 日内关键位（做空观察用）
+# ---------------------------------------------------------------------------
+# 周线关键位刻意丢掉离现价 1.5% 以内的位置（见 derive_levels 的注释），
+# 但做空要盯的恰是「贴着现价的压力」：前日高、当日高、VWAP。
+# 所以这里单独算一套日内位，不做距离过滤。
+
+@dataclass
+class IntradayLevels:
+    inst_id: str
+    current_price: float
+    day: date | None = None
+    day_high: float | None = None
+    day_low: float | None = None
+    prev_day_high: float | None = None
+    prev_day_low: float | None = None
+    vwap: float | None = None
+    bar_minutes: int = 5
+    source: str = "intraday"
+
+    def resistance_candidates(self) -> list[float]:
+        """所有可用的日内压力候选（去重升序）。"""
+        values = [v for v in (self.day_high, self.prev_day_high, self.vwap) if v and v > 0]
+        return sorted({round(v, 8) for v in values})
+
+    def nearest_resistance(self, max_pct: float | None = None) -> float | None:
+        """现价上方最近的日内压力；都在下方（已突破）时退而取最高候选。
+
+        max_pct 限制候选与现价的偏离百分比，避免选到很远的位。
+        """
+        candidates = self.resistance_candidates()
+        if not candidates:
+            return None
+        if max_pct is not None:
+            cap = self.current_price * (1 + max_pct / 100.0)
+            floor = self.current_price * (1 - max_pct / 100.0)
+            candidates = [v for v in candidates if floor <= v <= cap] or candidates
+        above = [v for v in candidates if v >= self.current_price]
+        return above[0] if above else max(candidates)
+
+    def as_dict(self) -> dict:
+        return {
+            "source": self.source,
+            "day": self.day.isoformat() if self.day else None,
+            "bar_minutes": self.bar_minutes,
+            "day_high": self.day_high,
+            "day_low": self.day_low,
+            "prev_day_high": self.prev_day_high,
+            "prev_day_low": self.prev_day_low,
+            "vwap": self.vwap,
+        }
+
+
+def derive_intraday_levels(
+    inst_id: str,
+    candles: list[Candle],
+    current_price: float,
+    bar_minutes: int = 5,
+) -> IntradayLevels:
+    """按北京时间自然日切分日内 K 线，算当日高/低、前日高/低、当日 VWAP。
+
+    只用真实 K 线，不做任何臆测。VWAP 用典型价 (高+低+收)/3 按成交量加权。
+    """
+    levels = IntradayLevels(inst_id=inst_id, current_price=current_price, bar_minutes=bar_minutes)
+    if not candles:
+        return levels
+
+    by_day: dict[date, list[Candle]] = {}
+    for candle in candles:
+        day = candle.dt_utc.astimezone(BEIJING).date()
+        by_day.setdefault(day, []).append(candle)
+
+    days = sorted(by_day)
+    today = days[-1]
+    today_candles = by_day[today]
+    levels.day = today
+    levels.day_high = max(c.high for c in today_candles)
+    levels.day_low = min(c.low for c in today_candles)
+
+    total_vol = sum(c.volume for c in today_candles)
+    if total_vol > 0:
+        typical = sum((c.high + c.low + c.close) / 3.0 * c.volume for c in today_candles)
+        levels.vwap = typical / total_vol
+
+    if len(days) >= 2:
+        prev_candles = by_day[days[-2]]
+        levels.prev_day_high = max(c.high for c in prev_candles)
+        levels.prev_day_low = min(c.low for c in prev_candles)
+
+    return levels

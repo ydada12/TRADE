@@ -10,6 +10,7 @@ OKX candle 返回格式为「时间倒序」，元素：
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -49,6 +50,31 @@ class Ticker:
         return datetime.fromtimestamp(self.ts_ms / 1000, tz=timezone.utc)
 
 
+@dataclass(frozen=True)
+class BookLevel:
+    """盘口一档：price=挂单价，size=挂单量（张/币）。"""
+    price: float
+    size: float
+
+
+@dataclass(frozen=True)
+class OrderBook:
+    """OKX 盘口快照（只读）。bids 买盘降序（买一在前），asks 卖盘升序（卖一在前）。"""
+    inst_id: str
+    bids: list[BookLevel]
+    asks: list[BookLevel]
+    ts_ms: int
+
+
+@dataclass(frozen=True)
+class Trade:
+    """逐笔成交（只读）。side 是主动方方向：buy=主动买入，sell=主动卖出。"""
+    ts_ms: int
+    price: float
+    size: float
+    side: str
+
+
 class OkxClient:
     def __init__(
         self,
@@ -59,6 +85,7 @@ class OkxClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.http = HttpClient(timeout=timeout, max_retries=max_retries, backoff=backoff)
+        self._inst_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
     # ---------- 内部 ----------
     def _api(self, path: str, params: dict[str, Any]) -> list[Any]:
@@ -92,10 +119,22 @@ class OkxClient:
             return None
 
     # ---------- 公开方法 ----------
+    INSTRUMENT_TTL_SECONDS = 6 * 3600
+
     def get_instrument(self, inst_id: str, inst_type: str) -> dict[str, Any] | None:
-        """确认交易对真实存在。返回 None 表示不存在（调用方必须报错而不是猜）。"""
+        """确认交易对真实存在。返回 None 表示不存在（调用方必须报错而不是猜）。
+
+        存在的合约缓存 6 小时（上市状态不会每分钟变）；不存在的不缓存，每次都如实报错。
+        """
+        key = (inst_type, inst_id)
+        hit = self._inst_cache.get(key)
+        if hit and time.time() - hit[0] < self.INSTRUMENT_TTL_SECONDS:
+            return hit[1]
         rows = self._api("/api/v5/public/instruments", {"instType": inst_type, "instId": inst_id})
-        return rows[0] if rows else None
+        inst = rows[0] if rows else None
+        if inst is not None:
+            self._inst_cache[key] = (time.time(), inst)
+        return inst
 
     def get_ticker(self, inst_id: str) -> Ticker:
         rows = self._api("/api/v5/market/ticker", {"instId": inst_id})
@@ -115,6 +154,47 @@ class OkxClient:
     def get_weekly_candles(self, inst_id: str, bar: str = "1W", limit: int = 300) -> list[Candle]:
         """拉周K，返回按时间【升序】排列的列表。"""
         return self.get_candles(inst_id, bar=bar, limit=limit)
+
+    @staticmethod
+    def _parse_levels(raw: Any) -> list[BookLevel]:
+        levels: list[BookLevel] = []
+        for row in raw or []:
+            try:
+                levels.append(BookLevel(price=float(row[0]), size=float(row[1])))
+            except (IndexError, TypeError, ValueError):
+                continue
+        return levels
+
+    def get_orderbook(self, inst_id: str, depth: int = 50) -> OrderBook:
+        """只读拉取盘口快照。depth 建议 50（够了，太多档位噪声更大）。"""
+        rows = self._api("/api/v5/market/books", {"instId": inst_id, "sz": str(int(depth))})
+        if not rows:
+            raise HttpError(f"OKX 没有返回 {inst_id} 的盘口")
+        d = rows[0]
+        return OrderBook(
+            inst_id=inst_id,
+            bids=self._parse_levels(d.get("bids")),
+            asks=self._parse_levels(d.get("asks")),
+            ts_ms=int(d.get("ts") or 0),
+        )
+
+    def get_trades(self, inst_id: str, limit: int = 100) -> list[Trade]:
+        """只读拉取最近逐笔成交（side 为主动方方向）。"""
+        rows = self._api("/api/v5/market/trades", {"instId": inst_id, "limit": str(int(limit))})
+        trades: list[Trade] = []
+        for r in rows or []:
+            try:
+                trades.append(
+                    Trade(
+                        ts_ms=int(r["ts"]),
+                        price=float(r["px"]),
+                        size=float(r["sz"]),
+                        side=str(r.get("side") or ""),
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return trades
 
     def get_candles(self, inst_id: str, bar: str = "5m", limit: int = 300) -> list[Candle]:
         """拉任意周期K线，返回按时间【升序】排列的列表。
