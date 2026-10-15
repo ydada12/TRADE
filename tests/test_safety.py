@@ -161,14 +161,14 @@ def test_position_pnl() -> None:
     print("\n[持仓] 浮盈亏为本地确定性计算")
     pnl = compute_position_pnl(
         {"side": "long", "entry_price": 100.0, "margin_usdt": 100.0, "leverage": 4},
-        last_price=80.81,
+        last_price=96.8,
     )
     check("能算出盈亏", pnl is not None)
     if pnl:
         check("名义价值 = 保证金 x 杠杆", abs(pnl.notional - 400.0) < 1e-6, str(pnl.notional))
         check("浮亏为负", pnl.unrealized < 0, str(pnl.unrealized))
         check("盈亏符号与方向一致（多单跌则亏）",
-              abs(pnl.unrealized - (80.81 - 100.0) * pnl.qty) < 1e-6)
+              abs(pnl.unrealized - (96.8 - 100.0) * pnl.qty) < 1e-6)
 
     short = compute_position_pnl(
         {"side": "short", "entry_price": 100.0, "margin_usdt": 10.0, "leverage": 2},
@@ -458,6 +458,9 @@ def _make_monitor(tmp_dir: Path):
     cfg = load_config()
     cfg._data["app"]["state_file"] = str(tmp_dir / "state.json")
     cfg._data["app"]["log_dir"] = str(tmp_dir / "logs")
+    # 告警历史也要落到临时目录：否则测试造出来的假告警会混进真实的 state/alerts.jsonl，
+    # 面板上就会多出「测试时才存在」的点位。
+    cfg._data["app"]["alert_history_file"] = str(tmp_dir / "alerts.jsonl")
     monitor = Monitor(cfg, dry_run=False)
     # Windows 下未释放的日志文件句柄会让 TemporaryDirectory 清理失败（WinError 32）。
     # 测试不校验日志文件内容，这里关掉文件 handler，只留控制台输出。
@@ -493,7 +496,7 @@ def test_push_failure_not_lost() -> None:
                           previous=3.5, importance=3)
         fp = f"event|{event.fingerprint}"
         m.calendar.fetch_range = lambda *a, **k: [event]
-        m._symbol_levels = lambda symbol: (levels_dict, 80.0, "2026-10-14 00:00:00")
+        m._symbol_levels = lambda symbol: (levels_dict, 80.0, "2026-10-14 00:00:00", 1760000000000)
 
         sent: list[str] = []
         net = {"down": True}
@@ -521,7 +524,7 @@ def test_push_failure_not_lost() -> None:
     with tempfile.TemporaryDirectory() as td:
         m = _make_monitor(Path(td))
         m.calendar.fetch_range = lambda *a, **k: [event]
-        m._symbol_levels = lambda symbol: (levels_dict, 80.0, "ts")
+        m._symbol_levels = lambda symbol: (levels_dict, 80.0, "ts", 1760000000000)
         sent2: list[str] = []
         m.notifier.send = lambda t, b: (sent2.append(t),
                                         SimpleNamespace(ok=False, detail="down"))[1]
@@ -817,6 +820,304 @@ def test_short_alert_wording() -> None:
         check("红线过滤器无违规", m.safety.violations(text) == [], str(m.safety.violations(text)))
 
 
+def test_multi_sendkey() -> None:
+    print("\n[推送] 多个 SendKey（一次推给多个用户）")
+    from types import SimpleNamespace
+
+    from src.http_util import HttpError
+    from src.notify.serverchan import ServerChanNotifier, mask_key, parse_send_keys
+
+    keys = parse_send_keys("SCTaaaa11112222bbbb, SCTcccc33334444dddd;SCTeeee55556666ffff")
+    check("逗号/分号分隔的多个 key 都解析出来", len(keys) == 3, str(keys))
+    check("旧的单 key 写法仍兼容",
+          parse_send_keys("SCTonly111122223333") == ["SCTonly111122223333"])
+    check("重复 key 只保留一个", len(parse_send_keys("SCTsame,SCTsame")) == 1)
+    check("空值/模板占位符被剔除",
+          parse_send_keys("  , SCT在这里填你的sendkey , sk-在这里填你的-deepseek-key ") == [])
+    check("模板占位符不算「已配置」",
+          not ServerChanNotifier("SCT在这里填你的sendkey", dry_run=True).configured)
+    check("日志脱敏：只留头尾",
+          mask_key("SCTaaaaaaaaaaaa1111bbbb2222cccc") == "SCTaaaaa…cccc")
+
+    class FakeHttp:
+        """按 key 决定成功/失败，用于验证「部分失败」的语义。"""
+
+        def __init__(self, fail_keys: tuple[str, ...] = ()) -> None:
+            self.fail_keys = set(fail_keys)
+            self.hit: list[str] = []
+
+        def request(self, method: str, url: str, data=None):
+            key = url.rsplit("/", 1)[-1].removesuffix(".send")
+            self.hit.append(key)
+            if key in self.fail_keys:
+                raise HttpError("boom")
+            return SimpleNamespace(status_code=200,
+                                   json=lambda: {"code": 0, "data": {"pushid": "x"}})
+
+    two = "SCTkeyA000000000000,SCTkeyB000000000000"
+    n = ServerChanNotifier(two, max_retries=0, retry_backoff_seconds=0.0)
+    n.http = FakeHttp()
+    r = n.send("标题", "正文")
+    check("两个目标都成功 -> ok=True", r.ok and len(n.http.hit) == 2, str(r.detail))
+    check("每个目标各发一次",
+          n.http.hit == ["SCTkeyA000000000000", "SCTkeyB000000000000"], str(n.http.hit))
+
+    n2 = ServerChanNotifier(two, max_retries=0, retry_backoff_seconds=0.0)
+    n2.http = FakeHttp(fail_keys=("SCTkeyB000000000000",))
+    r2 = n2.send("标题", "正文")
+    check("有一个目标失败 -> 整体判失败（上层会重发，不漏收）", not r2.ok, str(r2.detail))
+    check("失败详情标明是哪个目标挂了", "失败" in r2.detail, str(r2.detail))
+
+    r3 = ServerChanNotifier("").send("标题", "正文")
+    check("一个 key 都没有 -> 如实报 missing_send_key",
+          not r3.ok and r3.detail == "missing_send_key", str(r3.detail))
+
+
+def test_calendar_columns() -> None:
+    print("\n[日历] akshare 真实列名映射（防真实值「公布」被漏掉）")
+    from src.datasource.econ_calendar import EconCalendarClient
+
+    row = {
+        "日期": "2026-10-14", "时间": "20:30", "地区": "美国",
+        "事件": "美国9月CPI年率未季调(%)",
+        "公布": "3.70", "预期": "3.60", "前值": "3.40", "重要性": "2",
+    }
+    e = EconCalendarClient._build_event(row)
+    check("真实列名「公布」能解析成实际值", e is not None and e.actual == 3.70,
+          str(e and e.actual))
+    check("预期解析成 3.60", e.forecast == 3.60, str(e.forecast))
+    check("前值解析成 3.40", e.previous == 3.40, str(e.previous))
+    check("重要性解析成 2", e.importance == 2, str(e.importance))
+    check("原始字段里保留了实际值便于回溯", e.raw.get("actual") == "3.70", str(e.raw))
+
+    legacy = {k: v for k, v in row.items() if k != "公布"}
+    legacy["今值"] = "3.70"
+    e2 = EconCalendarClient._build_event(legacy)
+    check("旧列名「今值」仍兼容", e2 is not None and e2.actual == 3.70, str(e2 and e2.actual))
+
+
+# ---------------------------------------------------------------- 面板：告警历史
+def test_alert_history() -> None:
+    print("\n[面板] 告警历史落盘 / 读回 / 裁剪")
+    import tempfile
+
+    from src.dashboard.history import AlertHistory, AlertRecord
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # 目录不存在也要能自动建（state/ 可能被手动清空过）
+        history = AlertHistory(Path(tmp) / "sub" / "alerts.jsonl")
+        record = AlertRecord(
+            ts_ms=1792051721469, recorded_at="2026-10-15 16:08:41",
+            inst_id="TQQQ-USDT-SWAP", symbol="TQQQ", short_name="TQQQ",
+            signal_type="做空观察位", title="【TQQQ】做空观察位｜现价 74.23",
+            what_happened="价格触及做空观察位", price=74.23, support=69.76, resistance=72.78,
+            fingerprint="short|TQQQ-USDT-SWAP|1", pushed_at="2026-10-15 03:23:34",
+            source="log_backfill",
+        )
+        check("目录不存在时也能写入", history.append(record), str(history.path))
+
+        # 坏行 / 空行 / BOM 都不该让读取炸掉（用户手改文件是常态）
+        with open(history.path, "a", encoding="utf-8") as fh:
+            fh.write('\ufeff{"ts_ms": 1, "inst_id": "X", "signal_type": "趋势"}\n')
+            fh.write("{这不是合法json\n\n")
+        loaded = history.load()
+        check("坏行被跳过、好行照读", len(loaded) == 2, f"读到 {len(loaded)} 条")
+        check("读回按时间升序",
+              [r.ts_ms for r in loaded] == [1, 1792051721469], str([r.ts_ms for r in loaded]))
+
+        line = record.to_line()
+        check("落盘中文不转义（方便直接 tail 文件）", "做空观察位" in line, line[:50])
+        check("序列化往返字段一致", AlertRecord.from_line(line) == record)
+        check("缺失值落成 null 而不是 0",
+              '"price": null' in AlertRecord().to_line(), AlertRecord().to_line())
+
+        check("按品种过滤生效", len(history.load(inst_id="TQQQ-USDT-SWAP")) == 1)
+        check("按类型过滤生效", len(history.load(signal_type="趋势")) == 1)
+        check("按起始时间过滤生效", len(history.load(since_ms=1792051721469)) == 1)
+
+        history.append(AlertRecord(ts_ms=None, inst_id="X", signal_type="趋势", title="无时间戳"))
+        removed = history.prune(keep_days=-1, max_lines=0)
+        check("过期记录会被裁掉", removed == 2, f"删除 {removed} 条")
+        rest = history.load()
+        check("没有时间戳的记录不会被误删", len(rest) == 1 and rest[0].ts_ms is None, str(rest))
+
+        history.append(record)
+        history.append(record)
+        check("max_lines 生效", history.prune(keep_days=36500, max_lines=1) == 2,
+              f"当前 {len(history.load())} 条")
+
+
+def test_alert_record_from_alert() -> None:
+    print("\n[面板] Alert / EventAlert → 落盘记录（字段映射）")
+    from src.alert import SIGNAL_EVENT, SIGNAL_SHORT, Alert, EventAlert
+    from src.dashboard.history import record_from_alert
+
+    alert = Alert(
+        symbol="TQQQ（TQQQ-USDT-SWAP）", what_happened="价格触及做空观察位",
+        time_text="2026-10-15 03:23:34 北京时间", price=74.23, support=69.76, resistance=72.78,
+        signal_type=SIGNAL_SHORT, short_name="TQQQ",
+        inst_id="TQQQ-USDT-SWAP", ts_ms=1792051721469,
+    )
+    record = record_from_alert(alert, "【TQQQ】做空观察位｜现价 74.23", "short|TQQQ-USDT-SWAP|1")
+    check("品种标识进了记录", record.inst_id == "TQQQ-USDT-SWAP", record.inst_id)
+    check("数据时间进了记录（K线对齐的唯一依据）", record.ts_ms == 1792051721469, str(record.ts_ms))
+    check("类型/价格/关键位都对上",
+          (record.signal_type, record.price, record.support, record.resistance)
+          == (SIGNAL_SHORT, 74.23, 69.76, 72.78))
+    check("落盘时间自动补上", len(record.recorded_at) == 19, record.recorded_at)
+    check("指纹被保留（便于回溯是哪条信号）", record.fingerprint == "short|TQQQ-USDT-SWAP|1")
+
+    event = EventAlert(
+        headline="美国9月CPI年率未季调(%)", stage="pre", happened="今晚 20:30 公布",
+        time_text="2026-10-14 20:30 北京时间", body="剧本", short_name="TQQQ", price=81.2,
+        inst_id="TQQQ-USDT-SWAP", ts_ms=1792051721469,
+    )
+    event_record = record_from_alert(event, "【TQQQ】事件预警：CPI", "event|1")
+    check("EventAlert 没有 signal_type 时归为「事件」",
+          event_record.signal_type == SIGNAL_EVENT, event_record.signal_type)
+    check("EventAlert 的 happened 也收进记录",
+          event_record.what_happened == "今晚 20:30 公布", event_record.what_happened)
+    check("现价缺失时落成 None（不是 0）",
+          record_from_alert(Alert(symbol="X", what_happened="x", time_text="t", price=None),
+                            "t", "f").price is None)
+
+
+def test_bar_alignment() -> None:
+    print("\n[面板] 告警与 K 线的时间对齐（口径用真实 OKX 样本核对）")
+    from src.dashboard.history import alert_index_for_ts, bar_ms, bar_start_ms
+
+    check("bar_ms 换算正确",
+          (bar_ms("5m"), bar_ms("15m"), bar_ms("1H"), bar_ms("4H"), bar_ms("1D"), bar_ms("1W"))
+          == (300000, 900000, 3600000, 14400000, 86400000, 604800000))
+    check("认不出的周期不硬猜", bar_ms("7x") is None and bar_ms("") is None)
+
+    check("5m 按 UTC 5 分钟对齐", bar_start_ms(1792051721469, "5m") == 1792051500000,
+          str(bar_start_ms(1792051721469, "5m")))
+    check("1H 按 UTC 整点对齐", bar_start_ms(1792051721469, "1H") == 1792051200000,
+          str(bar_start_ms(1792051721469, "1H")))
+
+    # 实测：OKX 日K 的开盘是北京时间 0 点（ts=1791993600000 → 北京时间 2026-10-15 00:00）
+    day = 1791993600000
+    check("1D 按北京时间零点对齐（真实样本）",
+          bar_start_ms(day + 5 * 3600 * 1000, "1D") == day,
+          str(bar_start_ms(day + 5 * 3600 * 1000, "1D")))
+    check("1D 若按 UTC 取模会错一根（回归防线）",
+          bar_start_ms(day + 3600 * 1000, "1D") != (day + 3600 * 1000) // 86400000 * 86400000)
+
+    # 实测：OKX 周K 开盘是北京时间周一 0 点（ts=1791734400000 → 北京时间 2026-10-12 周一）
+    week = 1791734400000
+    check("1W 按北京时间周一零点对齐（真实样本）",
+          bar_start_ms(week + 3 * 86400000, "1W") == week,
+          str(bar_start_ms(week + 3 * 86400000, "1W")))
+    check("周内任意一天都落到同一根周K",
+          bar_start_ms(week, "1W") == bar_start_ms(week + 6 * 86400000, "1W") == week)
+
+    times = [1000, 2000, 3000]
+    check("告警落在哪根K线：取最后一根起始时间 <= 告警时间", alert_index_for_ts(times, 2500) == 1)
+    check("正好压在边界上归到该根", alert_index_for_ts(times, 2000) == 1)
+    check("早于全部K线返回 -1", alert_index_for_ts(times, 500) == -1)
+    check("晚于全部K线归到最后一根", alert_index_for_ts(times, 99999) == 2)
+    check("空列表 / 无时间不炸",
+          alert_index_for_ts([], 100) == -1 and alert_index_for_ts(times, None) == -1)
+
+
+def test_dashboard_readonly() -> None:
+    print("\n[面板] 只读红线（固化成测试，防止以后加出写接口）")
+    root = Path(__file__).resolve().parent.parent
+    targets = [
+        root / "src" / "dashboard" / "__init__.py",
+        root / "src" / "dashboard" / "history.py",
+        root / "src" / "dashboard" / "service.py",
+        root / "src" / "dashboard" / "server.py",
+        root / "tools" / "dashboard.py",
+        root / "tools" / "backfill_alerts.py",
+        root / "web" / "app.js",
+        root / "web" / "index.html",
+    ]
+    forbidden = ["do_POST", "do_PUT", "do_DELETE", "/api/v5/trade", "place-order",
+                 "ServerChanNotifier", "deepseek", "llm"]
+    problems: list[str] = []
+    for path in targets:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for word in forbidden:
+            if word in text:
+                problems.append(f"{path.name} 含 {word}")
+    check("面板代码里没有写操作 / 交易接口 / 推送 / 大模型调用",
+          not problems, "; ".join(problems))
+
+    server_text = (root / "src" / "dashboard" / "server.py").read_text(encoding="utf-8")
+    without_get = server_text.replace("def do_GET", "")
+    check("服务端只实现了 do_GET", "def do_GET" in server_text and "def do_" not in without_get)
+
+
+def test_snapshot_schema() -> None:
+    print("\n[面板] 快照字段齐全、取不到数时为 null、建议话术固定")
+    import tempfile
+
+    from src.config import load_config
+    from src.dashboard.service import DashboardService
+    from src.datasource.okx import HttpError, Ticker
+
+    class UpOkx:
+        """行情可用：返回真实结构的数据。"""
+
+        def get_ticker(self, inst_id: str) -> Ticker:
+            return Ticker(inst_id=inst_id, last=74.23, open_24h=75.0, high_24h=76.0,
+                          low_24h=73.0, vol_24h=1000.0, ts_ms=1792051721469)
+
+        def get_candles(self, inst_id: str, bar: str = "5m", limit: int = 300) -> list:
+            return [Candle(ts_ms=1792051500000, open=1.0, high=2.0, low=0.5,
+                           close=1.5, volume=10.0, confirmed=True)]
+
+        def get_weekly_candles(self, inst_id: str, bar: str = "1W", limit: int = 300) -> list:
+            return self.get_candles(inst_id, bar, limit)
+
+    class DownOkx:
+        """上游整体失败：所有取数都抛 HttpError。"""
+
+        def get_ticker(self, inst_id: str):
+            raise HttpError("模拟上游失败")
+
+        def get_candles(self, inst_id: str, bar: str = "5m", limit: int = 300):
+            raise HttpError("模拟上游失败")
+
+        def get_weekly_candles(self, inst_id: str, bar: str = "1W", limit: int = 300):
+            raise HttpError("模拟上游失败")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = load_config()
+        cfg._data["app"]["state_file"] = str(Path(tmp) / "state.json")
+        cfg._data["app"]["alert_history_file"] = str(Path(tmp) / "alerts.jsonl")
+        inst_id = cfg.symbols[0]["inst_id"]
+
+        service = DashboardService(cfg, ttl_seconds=5)
+        service.okx = UpOkx()  # type: ignore[assignment]
+        snap = service.snapshot(inst_id)
+        expected = {"inst_id", "name", "short_name", "enabled", "price", "ts_ms", "ts_text",
+                    "high_24h", "low_24h", "vol_24h", "support", "resistance", "supports",
+                    "resistances", "lookback_weeks", "trend", "action_text", "notes"}
+        check("快照字段齐全", expected.issubset(set(snap.keys())),
+              str(sorted(expected - set(snap.keys()))))
+        check("现价来自真实取数", snap["price"] == 74.23, str(snap["price"]))
+        check("建议动作是固定话术",
+              snap["action_text"] == "建议人工查看/等待确认", snap["action_text"])
+        check("没有趋势状态记录时不编造", snap["trend"] is None, str(snap["trend"]))
+
+        kline = service.kline(inst_id, "5m", 10)
+        check("K线根数与标签数一致",
+              bool(kline) and kline["count"] == 1 and len(kline["labels"]) == 1, str(kline))
+        check("K线标签是北京时间", kline["labels"][0] == "2026-10-15 16:05", kline["labels"][0])
+
+        broken = DashboardService(cfg, ttl_seconds=5)
+        broken.okx = DownOkx()  # type: ignore[assignment]
+        down = broken.snapshot(inst_id)
+        check("上游失败时现价是 null（不拿旧值冒充）", down["price"] is None, str(down["price"]))
+        check("上游失败时如实说明原因",
+              any("失败" in note for note in down["notes"]), str(down["notes"]))
+        check("上游失败时 K线明确报失败（不是空图伪装成功）",
+              broken.kline(inst_id, "5m", 10) is None)
+
+
 def main() -> int:
     print("=" * 66)
     print("双轨信号监控系统 —— 安全自测")
@@ -833,12 +1134,19 @@ def main() -> int:
     test_session_window_reset()
     test_push_failure_not_lost()
     test_caching()
+    test_calendar_columns()
     test_intraday_levels()
     test_orderflow_metrics()
     test_short_scoring()
     test_short_alert_wording()
     test_alert_layout()
+    test_multi_sendkey()
     test_formatting()
+    test_alert_history()
+    test_alert_record_from_alert()
+    test_bar_alignment()
+    test_dashboard_readonly()
+    test_snapshot_schema()
     print("\n" + "=" * 66)
     print(f"通过 {PASSED} 项，失败 {FAILED} 项")
     print("=" * 66)

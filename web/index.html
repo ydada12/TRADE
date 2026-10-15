@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>行情监控面板（只读）</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>行情监控面板</h1>
+    <span class="tag">本地只读</span>
+  </div>
+
+  <div class="controls">
+    <label class="field">
+      <span>品种</span>
+      <select id="symbol-select"></select>
+    </label>
+
+    <label class="field checkbox">
+      <input type="checkbox" id="auto-refresh" checked>
+      <span>自动刷新</span>
+    </label>
+
+    <button id="refresh-btn" class="btn">立即刷新</button>
+    <span id="refresh-time" class="muted">尚未取数</span>
+  </div>
+
+  <div class="notice">本页面只读展示，不构成任何买卖建议</div>
+</header>
+
+<div id="error-banner" class="banner hidden"></div>
+
+<main class="layout">
+  <aside class="panel snapshot">
+    <h2>当前状态</h2>
+    <div id="snapshot-body" class="snapshot-body">
+      <p class="muted">取数中…</p>
+    </div>
+  </aside>
+
+  <section class="panel chart-panel">
+    <!-- OKX 式横向行情条：现价按涨跌着色，右侧是 24h 统计 -->
+    <div class="quote-bar">
+      <div class="quote-left">
+        <div class="quote-name">
+          <span id="quote-symbol">—</span>
+          <span id="quote-badge" class="quote-badge hidden"></span>
+        </div>
+        <div class="quote-price-row">
+          <span id="quote-price" class="quote-price">数据源未提供</span>
+          <span id="quote-change" class="quote-change">数据源未提供</span>
+        </div>
+      </div>
+      <div class="quote-stats">
+        <div class="qstat"><span class="k">24h 最高</span><span class="v" id="quote-high">数据源未提供</span></div>
+        <div class="qstat"><span class="k">24h 最低</span><span class="v" id="quote-low">数据源未提供</span></div>
+        <div class="qstat"><span class="k">24h 成交量</span><span class="v" id="quote-vol">数据源未提供</span></div>
+      </div>
+    </div>
+
+    <!-- 周期 pill 组固定在图表左上角 -->
+    <div class="chart-toolbar">
+      <div id="bar-group" class="bar-group"></div>
+      <span id="chart-title" class="chart-title"></span>
+      <span id="chart-note" class="muted"></span>
+    </div>
+
+    <div id="chart" class="chart"></div>
+    <div class="legend">
+      <span><i class="badge badge-trend"></i>趋势</span>
+      <span><i class="badge badge-event"></i>事件</span>
+      <span><i class="badge badge-short"></i>做空观察位</span>
+      <span><i class="badge badge-session"></i>盘中波动</span>
+      <span><i class="badge badge-backfill"></i>日志回填（旧消息）</span>
+    </div>
+  </section>
+
+  <aside class="panel alerts-panel">
+    <div class="panel-head">
+      <h2>历史消息</h2>
+      <select id="type-filter">
+        <option value="">全部类型</option>
+        <option value="趋势">趋势</option>
+        <option value="事件预警">事件预警</option>
+        <option value="事件结果">事件结果</option>
+        <option value="做空观察位">做空观察位</option>
+        <option value="盘中波动">盘中波动</option>
+      </select>
+    </div>
+    <p id="alerts-summary" class="muted"></p>
+    <ul id="alerts-list" class="alerts-list"></ul>
+  </aside>
+</main>
+
+<footer class="footer">
+  数据来源：OKX 公开行情接口 / AKShare 经济日历（均为真实公开接口）·
+  取不到的字段一律显示「数据源未提供」，本页面不编造任何数字
+</footer>
+
+<script src="/vendor/echarts.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -14,6 +14,9 @@ app:
   log_dir: "logs"
   log_level: "INFO"          # DEBUG / INFO / WARNING / ERROR
   state_file: "state/state.json"
+  # 告警历史（append-only JSONL）。本地可视化面板靠它在 K 线上标注历史告警位置。
+  # 仅在推送成功之后追加一条；state/ 已被 .gitignore 忽略，不会进公开仓库。
+  alert_history_file: "state/alerts.jsonl"
   # true = 只写日志不真正推送（首次调试建议 true）
   dry_run: false
 
@@ -126,12 +129,13 @@ symbols:
       manual_support: []        # 想手动覆盖就填数字，如 [78.5, 75.0]
       manual_resistance: []
     # ---- 你本人下单的数据（只有你能提供，系统不推导）----
+    # 下面是【示例占位数字】，请替换成你自己的真实持仓；没有持仓就把 side / entry_price 留空（null）。
     position:
       side: "long"              # long / short
-      entry_price: 100.0
-      margin_usdt: 100.0
+      entry_price: 100.0        # 示例：开仓均价
+      margin_usdt: 100.0        # 示例：占用保证金（USDT）
       leverage: 4
-      note: "4x 杠杆多单"
+      note: "示例：4x 杠杆多单（请改成你自己的）"
 
   - name: "WTI 原油（OKX 永续）"
     inst_id: "CL-USDT-SWAP"

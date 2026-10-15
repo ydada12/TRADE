@@ -37,12 +37,14 @@ class Candle:
 
 @dataclass(frozen=True)
 class Ticker:
+    """24h 统计字段可为 None：OKX 没返回就是缺失，绝不用 0 冒充一个数字。"""
+
     inst_id: str
     last: float
-    open_24h: float
-    high_24h: float
-    low_24h: float
-    vol_24h: float
+    open_24h: float | None
+    high_24h: float | None
+    low_24h: float | None
+    vol_24h: float | None
     ts_ms: int
 
     @property
@@ -136,6 +138,17 @@ class OkxClient:
             self._inst_cache[key] = (time.time(), inst)
         return inst
 
+    @staticmethod
+    def _opt_float(d: dict[str, Any], key: str) -> float | None:
+        """取可缺失的数字字段：没返回 / 空串 / 解析不了一律 None（不填 0 冒充）。"""
+        value = d.get(key)
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def get_ticker(self, inst_id: str) -> Ticker:
         rows = self._api("/api/v5/market/ticker", {"instId": inst_id})
         if not rows:
@@ -144,10 +157,10 @@ class OkxClient:
         return Ticker(
             inst_id=inst_id,
             last=float(d["last"]),
-            open_24h=float(d.get("open24h") or 0),
-            high_24h=float(d.get("high24h") or 0),
-            low_24h=float(d.get("low24h") or 0),
-            vol_24h=float(d.get("vol24h") or 0),
+            open_24h=self._opt_float(d, "open24h"),
+            high_24h=self._opt_float(d, "high24h"),
+            low_24h=self._opt_float(d, "low24h"),
+            vol_24h=self._opt_float(d, "vol24h"),
             ts_ms=int(d["ts"]),
         )
 
