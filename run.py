@@ -48,6 +48,7 @@ from src.config import PROJECT_ROOT, Config, load_config
 from src.datasource.econ_calendar import BEIJING, EconCalendarClient, EconEvent
 from src.datasource.okx import Candle, OkxClient
 from src.datasource.us_stock import UsStockClient
+from src.dashboard.history import AlertHistory, record_from_alert
 from src.llm.deepseek import DeepSeekClient
 from src.llm.prompts import (
     SYSTEM_PROMPT,
@@ -127,6 +128,11 @@ class Monitor:
         self.log_file = log_dir
 
         self.state = StateStore(cfg.resolve_path(str(self.app.get("state_file", "state/state.json"))))
+        # 告警历史（面板用来在 K 线上标注历史位置）。只在推送成功后才追加，
+        # 写失败不影响推送判定——见 AlertHistory.append。
+        self.history = AlertHistory(cfg.resolve_path(
+            str(self.app.get("alert_history_file", "state/alerts.jsonl"))
+        ))
 
         market = cfg.get("market", {}) or {}
         self.okx = OkxClient(
@@ -238,12 +244,16 @@ class Monitor:
 
     # ================= 推送 =================
     def push_status(self, title: str, body: str, fingerprint: str,
-                    force: bool = False, cooldown_minutes: float | None = None) -> str:
+                    force: bool = False, cooldown_minutes: float | None = None,
+                    alert: Alert | EventAlert | None = None) -> str:
         """推送并返回结果：PUSH_SENT / PUSH_COOLDOWN / PUSH_FAILED。
 
         调用方必须区分「冷却中跳过」和「真的发送失败」：
         前者说明这条信号刚推过，可以放心记为已处理；
         后者说明用户根本没收到，不能把状态记成已处理，否则这条信号永远丢了。
+
+        alert：可选。传了就在**推送成功之后**把它结构化落盘（面板标注 K 线用）。
+        冷却跳过不写（早写过），发送失败不写（用户没收到）。
         """
         body = sanitize_for_push(body)
         body = self.safety.ensure_disclaimer(body)
@@ -262,14 +272,18 @@ class Monitor:
             self.state.mark_sent(fingerprint)
             self.state.save()
             log.info("已推送：%s", title)
+            if alert is not None:
+                self.history.append(record_from_alert(alert, title, fingerprint))
             return PUSH_SENT
         log.error("推送失败：%s -> %s", title, result.detail)
         return PUSH_FAILED
 
     def push(self, title: str, body: str, fingerprint: str,
-             force: bool = False, cooldown_minutes: float | None = None) -> bool:
+             force: bool = False, cooldown_minutes: float | None = None,
+             alert: Alert | EventAlert | None = None) -> bool:
         """兼容旧调用：只在真的发出去时返回 True。"""
-        return self.push_status(title, body, fingerprint, force, cooldown_minutes) == PUSH_SENT
+        return self.push_status(title, body, fingerprint, force, cooldown_minutes,
+                                alert) == PUSH_SENT
 
     def _delivery_settled(self, retry_key: str, status: str, force: bool) -> bool:
         """这条信号算不算「处理完了」（可以落状态/标记已发）。
@@ -459,7 +473,11 @@ class Monitor:
             try:
                 body = self._build_trend_alert(symbol, snapshot, levels, breaks, ticker,
                                                history_desc, divergence)
-                status = self.push_status(body.title(), body.render(), fp, force=force)
+                # 面板标注用：钉住品种与「当时看到的价」对应的时间
+                body.inst_id = inst_id
+                body.ts_ms = ticker.ts_ms
+                status = self.push_status(body.title(), body.render(), fp, force=force,
+                                          alert=body)
             except Exception:
                 log.error("%s 趋势告警生成/推送异常：\n%s", inst_id, traceback.format_exc())
                 status = PUSH_FAILED
@@ -786,18 +804,22 @@ class Monitor:
                     return symbol
         return symbols[0]
 
-    def _symbol_levels(self, symbol: dict) -> tuple[dict | None, float | None, str]:
-        """取该品种的真实行情 + 支撑压力位（周K来源与趋势轨保持一致）。"""
+    def _symbol_levels(self, symbol: dict) -> tuple[dict | None, float | None, str, int | None]:
+        """取该品种的真实行情 + 支撑压力位（周K来源与趋势轨保持一致）。
+
+        返回 (关键位字典, 最新价, 数据时间文本, 数据时间 epoch ms)。
+        最后一个值是给面板标注 K 线用的，行情拿不到时为 None。
+        """
         inst_id = symbol["inst_id"]
         try:
             ticker = self.okx.get_ticker(inst_id)
             candles, _ = self._weekly_candles(symbol)
         except Exception as exc:
             log.error("事件轨：%s 行情获取失败：%s", inst_id, exc)
-            return None, None, ""
+            return None, None, "", None
         confirmed = [c for c in candles if c.confirmed]
         if not confirmed:
-            return None, None, ""
+            return None, None, "", None
         levels_cfg = symbol.get("levels", {}) or {}
         levels = derive_levels(
             inst_id=inst_id,
@@ -808,7 +830,8 @@ class Monitor:
             manual_resistance=levels_cfg.get("manual_resistance"),
             min_distance_pct=float(levels_cfg.get("min_distance_pct", 1.5)),
         )
-        return levels.as_dict(), ticker.last, ticker.fetched_at_utc.strftime("%Y-%m-%d %H:%M:%S")
+        return (levels.as_dict(), ticker.last,
+                ticker.fetched_at_utc.strftime("%Y-%m-%d %H:%M:%S"), ticker.ts_ms)
 
     def _emit_pre_script(self, event: EconEvent, now: datetime, watch: list[str],
                          fp: str, force: bool) -> str:
@@ -817,7 +840,7 @@ class Monitor:
         if primary is None:
             log.warning("事件 %s 没有可关联的品种，跳过", event.name)
             return PUSH_SKIPPED
-        levels_dict, last_price, ts = self._symbol_levels(primary)
+        levels_dict, last_price, ts, ts_ms = self._symbol_levels(primary)
         facts = build_branch_facts(event, primary, levels_dict)
         facts["当前价"] = last_price
         facts["当前价时间"] = ts
@@ -853,9 +876,12 @@ class Monitor:
             previous_text=event.previous_text(),
             disclaimer=self.safety.disclaimer,
             extra_lines=[f"【重要性】{event.importance_text()}"],
+            inst_id=primary["inst_id"],
+            ts_ms=ts_ms,
         )
         log.info("事件预警：%s 公布时间 %s", event.name, publish_time_text(event, now))
-        return self.push_status(alert.title(), alert.render(), f"{fp}|pre", force=force)
+        return self.push_status(alert.title(), alert.render(), f"{fp}|pre", force=force,
+                                alert=alert)
 
     def _emit_post_result(self, event: EconEvent, now: datetime, watch: list[str],
                           fp: str, force: bool) -> str:
@@ -868,7 +894,7 @@ class Monitor:
         status = PUSH_SKIPPED
         targets = [primary]
         for symbol in targets:
-            levels_dict, last_price, ts = self._symbol_levels(symbol)
+            levels_dict, last_price, ts, ts_ms = self._symbol_levels(symbol)
             facts = build_branch_facts(event, symbol, levels_dict)
             facts["当前价"] = last_price
             facts["当前价时间"] = ts
@@ -911,10 +937,13 @@ class Monitor:
                     f"【实际值】{event.actual_text()}　【预期值】{event.forecast_text()}　"
                     f"【前值】{event.previous_text()}",
                 ],
+                inst_id=symbol["inst_id"],
+                ts_ms=ts_ms,
             )
             log.info("事件结果：%s 判定分支 %s", event.name, branch)
             status = self.push_status(
-                alert.title(), alert.render(), f"{fp}|post|{symbol['inst_id']}", force=force
+                alert.title(), alert.render(), f"{fp}|post|{symbol['inst_id']}", force=force,
+                alert=alert,
             )
         return status
 
@@ -968,7 +997,7 @@ class Monitor:
                 log.info("盘中监控：%s 时段[%s]内无超阈值波动", inst_id, window_label)
                 continue
 
-            levels_dict, _, _ = self._symbol_levels(symbol)
+            levels_dict, _, _, _ = self._symbol_levels(symbol)
 
             # ---- 防刷屏：幅度分档 + 升级即报 + 冷却（逻辑在 session.decide_alert，可测）----
             biggest = max(abs(h["change_pct"]) for h in hits)
@@ -991,12 +1020,14 @@ class Monitor:
                 continue
 
             body = self._build_session_alert(symbol, ticker, hits, window_label, levels_dict)
+            body.inst_id = inst_id
+            body.ts_ms = ticker.ts_ms
             fp = f"session|{inst_id}|{window_label}|b{decision.bucket}"
             log.info(
                 "盘中监控：%s 时段[%s] 触发告警（%s），最大幅度 %.2f%%，档位 %s",
                 inst_id, window_label, decision.reason, biggest, decision.bucket,
             )
-            if self.push(body.title(), body.render(), fp, force=True):
+            if self.push(body.title(), body.render(), fp, force=True, alert=body):
                 self.state.set_session(state_key, {
                     "last_ts": time.time(),
                     "last_bucket": max(decision.bucket, int(record.get("last_bucket", -1))),
@@ -1180,8 +1211,10 @@ class Monitor:
             try:
                 body = self._build_short_alert(symbol, ticker, intraday, metrics, decision,
                                                window_label, weekly_state)
+                body.inst_id = inst_id
+                body.ts_ms = ticker.ts_ms
                 status = self.push_status(body.title(), body.render(), fp, force=force,
-                                          cooldown_minutes=self.short_cooldown)
+                                          cooldown_minutes=self.short_cooldown, alert=body)
             except Exception:
                 log.error("%s 做空观察告警生成/推送异常：\n%s", inst_id, traceback.format_exc())
                 status = PUSH_FAILED
@@ -1336,7 +1369,9 @@ class Monitor:
 
         print("\n[1] 推送通道（Server酱）")
         if self.notifier.configured:
-            print("    SendKey：已从环境变量读取 ✓")
+            n_keys = len(self.notifier.send_keys)
+            suffix = f"（{n_keys} 个推送目标）" if n_keys > 1 else ""
+            print(f"    SendKey：已从环境变量读取 ✓{suffix}")
         else:
             print("    SendKey：未配置 ✗（设置环境变量 SERVERCHAN_SENDKEY）")
             ok = False

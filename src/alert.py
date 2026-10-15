@@ -83,6 +83,11 @@ class Alert:
     extra_lines: list[str] = field(default_factory=list)
     disclaimer: str = ""
 
+    # 面板标注用：品种标识 + 数据时间（epoch ms）。带默认值，兼容现网全部关键字构造。
+    # ts_ms 是「这条告警当时看到的价格对应的时间」，面板靠它把告警钉到对应的 K 线上。
+    inst_id: str = ""
+    ts_ms: int | None = None
+
     # ---------- 标题（微信通知栏只显示这一行，必须短且信息量大）----------
     def title(self) -> str:
         short = self.short_name or self.symbol
@@ -188,6 +193,10 @@ class EventAlert:
     title_hint: str = ""
     extra_lines: list[str] = field(default_factory=list)
     disclaimer: str = ""
+
+    # 面板标注用（与 Alert 同口径）：品种标识 + 数据时间（epoch ms）。
+    inst_id: str = ""
+    ts_ms: int | None = None
 
     def title(self) -> str:
         prefix = "事件预警" if self.stage == "pre" else "事件结果"
