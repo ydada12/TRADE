@@ -42,7 +42,10 @@ def _collect_numbers(node: Any, sink: set[str]) -> None:
             except ValueError:
                 pass
     elif isinstance(node, dict):
-        for value in node.values():
+        for key, value in node.items():
+            # 键名里也可能带数字：均线字段名就是 "MA20"/"MA30"，
+            # 模型写「MA20=74.426」时那个 20 必须算合法，否则整段解读被误拦。
+            _collect_numbers(str(key), sink)
             _collect_numbers(value, sink)
     elif isinstance(node, (list, tuple, set)):
         for value in node:
@@ -128,7 +131,8 @@ class DeepSeekClient:
     def available(self) -> bool:
         return bool(self.api_key)
 
-    def chat(self, system_prompt: str, user_message: str) -> str:
+    def chat(self, system_prompt: str, user_message: str,
+             max_tokens: int | None = None) -> str:
         if not self.available:
             raise HttpError("未配置 DeepSeek API key（环境变量 DEEPSEEK_API_KEY 为空）")
         payload = {
@@ -138,7 +142,7 @@ class DeepSeekClient:
                 {"role": "user", "content": user_message},
             ],
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": int(max_tokens or self.max_tokens),
             "stream": False,
         }
         resp = self.http.request("POST", f"{self.base_url}/chat/completions", json=payload)

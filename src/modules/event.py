@@ -41,6 +41,120 @@ INSTRUMENT_SENSITIVITY = {
     "CL-USDT-SWAP": {"risk": 0.3, "oil": 1.0, "label": "WTI 原油"},
 }
 
+# 「数值偏强（走高）」对两类资产的历史冲击方向：+1 利多 / -1 利空 / 0 无确定口径
+#   注意就业内部有反向指标（初请/失业率越高反而是坏事），见 INVERSE_EMPLOYMENT_KEYWORDS。
+CATEGORY_STRENGTH_IMPACT: dict[str, dict[str, int]] = {
+    "employment":    {"risk": -1, "oil": 0},   # 就业强 -> 美联储偏鹰 -> 压制风险资产
+    "inflation":     {"risk": -1, "oil": 0},   # 通胀强 -> 降息推迟 -> 压制风险资产
+    "rates":         {"risk": -1, "oil": 0},   # 偏紧利率信号 -> 压制风险资产
+    "growth":        {"risk": +1, "oil": 0},   # 增长强 -> 提振风险偏好
+    "oil_inventory": {"risk": 0, "oil": -1},   # 库存增加 -> 供应宽松 -> 利空油价
+    "generic":       {"risk": 0, "oil": 0},    # 认不出类别 -> 不许硬给方向
+}
+
+# 反向就业指标：这些指标「数值越高」代表就业/经济越弱，A/B 分支的方向要翻转
+INVERSE_EMPLOYMENT_KEYWORDS = ("初请", "续请", "失业率", "失业金")
+
+VERDICT_LONG = "long"
+VERDICT_SHORT = "short"
+VERDICT_TEXT = {VERDICT_LONG: "偏多", VERDICT_SHORT: "偏空"}
+
+# 方向传导链（强 / 弱各一句）。只描述历史一般规律，措辞里不许出现必然断言。
+_CHAIN: dict[str, tuple[str, str]] = {
+    "employment": (
+        "就业市场偏紧 → 美联储偏鹰、降息预期降温 → 历史上通常压制风险资产",
+        "就业动能降温 → 降息预期升温 → 历史上通常利好风险资产",
+    ),
+    "inflation": (
+        "通胀偏强 → 降息预期降温 → 历史上通常压制风险资产",
+        "通胀回落 → 降息预期升温 → 历史上通常利好风险资产",
+    ),
+    "rates": (
+        "货币政策偏紧 → 历史上通常压制风险资产",
+        "货币政策偏松 → 历史上通常利好风险资产",
+    ),
+    "growth": (
+        "增长数据偏强 → 历史上通常提振风险偏好",
+        "增长数据偏弱 → 历史上通常打压风险偏好",
+    ),
+    "oil_inventory": (
+        "库存增加 → 供应偏宽松 → 历史上通常利空油价",
+        "库存下降 → 供应偏紧 → 历史上通常利多油价",
+    ),
+}
+
+
+def is_inverse_employment(event_name: str) -> bool:
+    """初请失业金/失业率这类指标：数值越高代表就业越弱（与非农方向相反）。"""
+    return categorize(event_name) == "employment" and any(
+        k in event_name for k in INVERSE_EMPLOYMENT_KEYWORDS
+    )
+
+
+def effective_strength(event_name: str, branch: str) -> str | None:
+    """把 A/B 分支换算成「经济实际偏强还是偏弱」。
+
+    A = 实际值高于基准（预期或前值），B = 低于基准。
+    反向就业指标（初请、失业率）走高反而是偏弱。
+    """
+    if branch == "A":
+        return "weak" if is_inverse_employment(event_name) else "strong"
+    if branch == "B":
+        return "strong" if is_inverse_employment(event_name) else "weak"
+    return None
+
+
+def verdict_for_event(event_name: str, inst_id: str, branch: str,
+                      region: str = "") -> dict[str, Any] | None:
+    """确定性方向结论：返回 {verdict, chain, category, strength}，给不出方向返回 None。
+
+    给不出的情况（调用方应当【不推送】，而不是硬猜一个方向）：
+      - 分支 unknown / C（C 要由调用方先用前值再归并一次，仍无法归并才传进来）
+      - 事件类别认不出来（generic），没有可依据的历史口径
+      - 该品种对此事件既不敏感于风险偏好也不敏感于油价
+    """
+    strength = effective_strength(event_name, branch)
+    if strength is None:
+        return None
+    category = categorize(event_name)
+    impact = CATEGORY_STRENGTH_IMPACT.get(category) or CATEGORY_STRENGTH_IMPACT["generic"]
+    sens = INSTRUMENT_SENSITIVITY.get(
+        inst_id, {"risk": 0.5, "oil": 0.0, "label": inst_id}
+    )
+    score = impact["risk"] * float(sens.get("risk", 0.0)) \
+        + impact["oil"] * float(sens.get("oil", 0.0))
+    if score == 0:
+        return None
+    verdict = VERDICT_LONG if score > 0 else VERDICT_SHORT
+    if strength == "weak":
+        verdict = VERDICT_SHORT if verdict == VERDICT_LONG else VERDICT_LONG
+    chain = _CHAIN[category][0 if strength == "strong" else 1]
+    if "美国" not in (region or "") and category != "oil_inventory":
+        # 非美事件不能套「美联储」字样
+        chain = chain.replace("美联储", "该国央行")
+    return {
+        "verdict": verdict,
+        "verdict_text": VERDICT_TEXT[verdict],
+        "chain": chain,
+        "category": category,
+        "strength": strength,
+    }
+
+
+def branch_from_previous(event: Any) -> str | None:
+    """C 分支（与预期持平）时，用「实际值 vs 前值」再归并一次方向。
+
+    与预期持平但较前值继续走高/走低，方向仍可依据真实数据给出；
+    连前值都没有、或与前值也持平，就没有数据依据，返回 None（调用方不推送）。
+    """
+    if event.actual is None or event.previous is None:
+        return None
+    if event.actual > event.previous:
+        return "A"
+    if event.actual < event.previous:
+        return "B"
+    return None
+
 
 def categorize(event_name: str) -> str:
     for category, keywords in CATEGORY_KEYWORDS:
@@ -204,17 +318,19 @@ def render_fallback_script(facts: dict[str, Any], inst_id: str,
 
 def render_post_fallback(branch: str, reason: str, event: Any,
                          levels_dict: dict[str, Any] | None,
-                         last_price: float | None) -> str:
+                         last_price: float | None,
+                         verdict: dict[str, Any] | None = None) -> str:
     """确定性「对号入座」文案。
 
     注意：reason 里已经包含「实际值 X 高于/低于预期 Y」，这里不要再重复一遍。
+    verdict 为 None 时不给方向结论（调用方通常会直接不推送）。
     """
     from ..alert import fmt_num
 
     branch_label = {
-        "A": "剧本A（强于预期）",
-        "B": "剧本B（弱于预期）",
-        "C": "剧本C（符合预期）",
+        "A": "剧本A（强于基准）",
+        "B": "剧本B（弱于基准）",
+        "C": "剧本C（符合基准）",
         "unknown": "无法归类（数据源缺预期值与前值）",
     }.get(branch, "无法归类")
 
@@ -227,6 +343,8 @@ def render_post_fallback(branch: str, reason: str, event: Any,
         parts.append(f"当前价 {fmt_num(last_price)} 已上破压力位 {fmt_num(resistance)}。")
     elif last_price is not None:
         parts.append(f"当前价 {fmt_num(last_price)} 仍在关键区间内。")
+    if verdict:
+        parts.append(f"方向研判：对本品种【{verdict['verdict_text']}】。{verdict['chain']}。")
     parts.append("请按预案自行判断，注意控制仓位风险。")
     return "".join(parts)
 

@@ -31,16 +31,17 @@
 
 ```
                     ┌─────────────────────────────────────┐
-                    │  run.py  主循环（每轮一次）          │
+                    │  run.py  主循环（每轮一次，编排层）    │
                     └──────────────┬──────────────────────┘
                                    │
         ┌──────────────────────────┼──────────────────────────┐
         ▼                          ▼                          ▼
 ┌───────────────┐        ┌───────────────┐          ┌───────────────┐
 │ 模块2 趋势轨   │        │ 模块3 事件轨   │          │ 模块5 盘中波动 │
-│ modules/trend │        │ modules/event │          │ modules/     │
-│               │        │               │          │  session     │
-│ 周线均线+状态机│        │ 公布前剧本     │          │ 重点时段盯急动 │
+│ modules/trend │        │ modules/event │          │ modules/      │
+│ +strategy/    │        │ +strategy/    │          │  session      │
+│  tracks/trend │        │  tracks/event │          │ +strategy/    │
+│ 周线均线+状态机│        │ 公布前剧本     │          │  tracks/session│
 │ 只在状态变化时 │        │ 公布后对号入座 │          │ 幅度分档防刷屏 │
 └───────┬───────┘        └───────┬───────┘          └───────┬───────┘
         │                        │                          │
@@ -51,6 +52,12 @@
                     │ 品种→发生了什么→时间→     │
                     │ 位置→压力→支撑→该做什么   │
                     └────────────┬────────────┘
+                                 ▼
+                    ┌─────────────────────────────────────┐
+                    │ src/strategy/gate.py 单点闸口        │
+                    │ 去重冷却→重点标记→免打扰(延迟补发)   │
+                    │ →真发送→成功才记状态+落历史          │
+                    └────────────┬────────────────────────┘
                                  ▼
                     ┌─────────────────────────┐
                     │ notify/serverchan.py     │
@@ -154,7 +161,7 @@ while True:
 
 ## 5. 模块2：趋势轨（周线）
 
-`src/modules/trend.py`
+`src/modules/trend.py`（确定性算法）+ `src/strategy/tracks/trend.py`（触发规则与文案）
 
 ### 5.1 计算内容（全部本地确定性计算）
 
@@ -192,7 +199,7 @@ MA20 需要 20 根已收盘周K。不足时：
 
 ## 6. 模块3：事件轨（三分支预案）
 
-`src/modules/event.py`
+`src/modules/event.py`（确定性判定）+ `src/strategy/tracks/event.py`（触发窗口与文案）
 
 ### 6.1 公布前（`pre_alert_minutes`，默认 180 分钟）
 
@@ -245,7 +252,7 @@ oil_inventory（EIA/API）          → CL-USDT-SWAP
 
 ## 7. 模块5：重点时段盘中波动监控
 
-`src/modules/session.py` + `run.py`
+`src/modules/session.py`（算法）+ `src/strategy/tracks/session.py`（规则与文案）
 
 ### 7.1 为什么需要
 
@@ -299,12 +306,31 @@ POST https://sctapi.ftqq.com/<SendKey>.send
 - 成功判定：HTTP 200 且 `code == 0`
 - **成功和失败都把标题与正文写入日志**（便于回溯）
 - `dry_run` 模式不发网络请求，只写日志
+- 多目标：`SERVERCHAN_SENDKEY` 可填多个 SendKey（英文逗号分隔），逐目标独立发送，
+  任一目标未送达即判定整体失败
+
+### 单点闸口 `push_status()`（src/strategy/gate.py）
+
+所有轨道的推送都走这一个出口，依次过滤：
+
+```
+指纹冷却跳过 → 算轨道/品种 → 重点加【重点】前缀 → 免打扰（非重点转延迟补发）
+→ 真发送 → 成功才记冷却 + 落告警历史
+```
+
+返回值 `PUSH_SENT` / `PUSH_COOLDOWN` / `PUSH_FAILED` / `PUSH_SKIPPED` / `PUSH_DEFERRED`。
+**必须区分「冷却中跳过」与「真的发送失败」**：后者不能落状态，否则这条信号永远丢失；
+连续失败 5 次（`MAX_PUSH_RETRIES`）后放弃，手动 `--force` 的失败不重试。
+完整策略（五条轨道规则与阈值、指纹表、免打扰延迟补发、大模型降级、文案风控）见
+[docs/PUSH_STRATEGY.md](docs/PUSH_STRATEGY.md)。
 
 ### 去重冷却
 
 - 趋势轨：指纹 `trend|<inst_id>|<state>`，冷却 `notify.cooldown_minutes`（默认 240 分钟）
 - 盘中波动：指纹带幅度档位 `session|<inst_id>|<时段>|b<档位>`，
   自管理冷却（见 §7.3）
+- 其余轨道：`event|…`、`world|<url_key>|<inst_id>`、`short|<inst_id>|<level>`，
+  共 6 种模板，全部定义在 `src/strategy/fingerprint.py`（格式锁定，勿改）
 
 ---
 
@@ -467,15 +493,21 @@ python run.py --check           # 运行时自检：配置、数据源、key、�
 ## 14. 文件索引
 
 ```
-run.py                          主程序、主循环、告警组装、CLI、回放工具
+run.py                          主程序入口 + 编排层：主循环、取数/缓存、调度、告警组装、CLI、回放工具
+                                （推送规则与文案在 src/strategy/，见 docs/PUSH_STRATEGY.md）
 config.yaml / config.example.yaml
 .env / .env.example
+docs/
+  PUSH_STRATEGY.md              推送策略唯一权威说明：轨道规则/闸口/指纹/风控/配置对照
+frontend/                       面板前端（纯前端，只读行情页 + 控制页；与推送策略无关）
+  index.html / app.js / style.css / vendor/echarts.min.js
 src/
   config.py                     配置加载、密钥读取、校验
   logutil.py                    日志（含跨天轮转）
   http_util.py                  带退避重试的 HTTP 客户端
   state.py                      状态持久化（趋势/去重/事件/盘中）
   alert.py                      推送格式渲染、风控过滤、持仓盈亏、关键位距离
+  control.py                    运行期控制项（品种开关/免打扰/重点/持仓），面板唯一写入口
   datasource/
     okx.py                      OKX 只读行情
     us_stock.py                 美股本土历史（Yahoo→Stooq）
@@ -485,6 +517,16 @@ src/
     event.py                    模块3 事件轨
     session.py                  模块5 盘中波动 + 防刷屏判定
     levels.py                   支撑/压力位推导
+  strategy/                     推送策略层（规则 / 文案 / 闸口，与前端完全分离）
+    gate.py                     单点闸口：去重冷却/重点标记/免打扰/失败重试/落历史
+    deferral.py                 免打扰延迟补发队列
+    fingerprint.py              6 种去重指纹模板（格式锁定，勿改）
+    wording.py                  措辞常量（状态短名 / 【重点】前缀）
+    memo.py                     同品种跨轨道口径差异提示
+    helpers.py                  轨道共用纯计算
+    tracks/
+      trend.py / event.py / world.py / session.py / short.py   五条轨道的触发规则与文案
+  dashboard/                    面板后端（只读聚合 + 控制项读写；不是前端页面）
   llm/
     prompts.py                  固定 system prompt（命中缓存）+ 动态 user
     deepseek.py                 DeepSeek 客户端 + 防编造数字校验

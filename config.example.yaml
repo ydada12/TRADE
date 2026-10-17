@@ -17,6 +17,11 @@ app:
   # 告警历史（append-only JSONL）。本地可视化面板靠它在 K 线上标注历史告警位置。
   # 仅在推送成功之后追加一条；state/ 已被 .gitignore 忽略，不会进公开仓库。
   alert_history_file: "state/alerts.jsonl"
+  # 运行期控制项（本地控制台写入：品种开关 / 免打扰 / 重点提醒 / 持仓覆盖）。
+  # 控制台只改这些运行期偏好，绝不回写本文件；state/ 已被 .gitignore 忽略。
+  control_file: "state/control.json"
+  # 免打扰期间被「延迟补发」的信号队列（同样在 state/ 下）
+  pending_file: "state/pending.json"
   # true = 只写日志不真正推送（首次调试建议 true）
   dry_run: false
 
@@ -71,6 +76,10 @@ market:
 calendar:
   provider: "akshare"            # akshare = 免费，无需 key
   days_ahead: 7
+  # 往前回看几天（默认 1）。数据源的「公布」列不是公布瞬间就填上的，实测常滞后
+  # 几十分钟到几小时，晚间的美国数据（20:30 / 22:30 公布）经常要等跨过北京时间
+  # 零点才填上；只从「今天」开始抓，隔夜的实际值就永远取不到。
+  lookback_days: 1
   # 日历缓存（分钟）。平时 cache_minutes 刷新一次；有关注事件即将公布/刚公布时
   # 改用 hot_cache_minutes，才能尽快拿到实际值。避免每分钟抓 7 天触发百度 403 限流。
   cache_minutes: 30
@@ -254,6 +263,10 @@ event:
   enabled: true
   pre_alert_minutes: 180        # 公布前多久推送剧本
   post_check_minutes: 20        # 公布后多久拉实际值对号入座
+  # 公布后最多等多久（分钟）才补推实际值。数据源的「公布」列滞后几十分钟到几小时
+  # 才填上，晚间的美国数据常跨过北京时间零点，凌晨公布的甚至要等到白天才填；
+  # 默认给 24 小时。超过这个时长仍未取到实际值就不再补推（避免把隔夜旧数据当新闻推）。
+  post_max_minutes: 1440
   # 单轮最多推几条事件，防止某天事件扎堆时连环轰炸
   max_events_per_run: 3
   # 事件影响哪些品种（不填 = 全部启用品种）
@@ -332,6 +345,40 @@ short_watch:
   counter_trend_penalty: 2     # 周线多头时逆势观察扣分
   score_threshold: 4           # 打分达到该值才推送
   cooldown_minutes: 180        # 同一观察区在该时间内不重复推
+
+# ---------- 国际大事轨（战争 / 技术突破 / 新法案 / 央行意外等）----------
+# 数据源全部免 key：GDELT 聚合全球英文媒体为主，BBC / 半岛 RSS 为辅。
+# 每条推送必须给出明确的【偏多 / 偏空】；方向由「确定性历史口径 + DeepSeek 研判」
+# 双保险给出，给不出方向的题材（如选举）宁可不推，绝不硬猜。
+world_events:
+  enabled: true
+  interval_minutes: 20         # 多久研判一轮（新闻不需要 60 秒一抓）
+  cache_minutes: 15            # 取数结果缓存，失败时回退旧缓存
+  timespan_hours: 12           # 只看最近多少小时的新闻
+  timeout_seconds: 20
+  min_score: 2                 # 关键词初筛门槛（标题命中 3 分、摘要 1 分）
+  require_title_hit: true      # 仅摘要蹭词、标题不沾边的不要
+  judge_batch: 12              # 一次喂给大模型研判的候选条数上限
+  judge_max_tokens: 3000       # 研判是整批 JSON 一次返回，上限太小会被截断成非法 JSON
+  max_pushes_per_run: 3        # 单轮推送上限（Server酱免费额度有限）
+  max_pushes_per_day: 6        # 当日推送上限
+  # 只对这些品种给方向（inst_id）；留空 = 全部启用品种
+  watch_symbols: []
+  gdelt:
+    enabled: true
+    maxrecords: 75
+    retries: 2                 # 429 限流时的额外重试次数（每次多等 5 秒）
+    # 检索式（GDELT DOC 2.0 语法），可用默认值
+    # query: "(war OR ...) sourcelang:eng"
+  rss:
+    enabled: true
+    feeds:
+      - "https://feeds.bbci.co.uk/news/world/rss.xml"
+      - "https://feeds.bbci.co.uk/news/business/rss.xml"
+      - "https://www.aljazeera.com/xml/rss/all.xml"
+  # 关键词分组（可增删；留空整段则用内置中英双语默认表）
+  # keyword_groups:
+  #   war: ["war", "airstrike", "战争", "空袭"]
 
 # ---------- 告警文案风控 ----------
 risk_disclaimer: "以上为历史规律梳理，仅供参考，决策与风险自负"

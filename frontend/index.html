@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>行情监控面板（只读）</title>
+<title>行情监控面板</title>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -11,10 +11,15 @@
   <div class="brand">
     <span class="dot"></span>
     <h1>行情监控面板</h1>
-    <span class="tag">本地只读</span>
+    <span class="tag">本地</span>
   </div>
 
-  <div class="controls">
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="market">行情</button>
+    <button class="tab" data-view="control">控制</button>
+  </nav>
+
+  <div class="controls" id="market-controls">
     <label class="field">
       <span>品种</span>
       <select id="symbol-select"></select>
@@ -29,12 +34,12 @@
     <span id="refresh-time" class="muted">尚未取数</span>
   </div>
 
-  <div class="notice">本页面只读展示，不构成任何买卖建议</div>
+  <div class="notice">行情页只读展示；「控制」页只改本地监控与推送偏好，不接交易、不下单</div>
 </header>
 
 <div id="error-banner" class="banner hidden"></div>
 
-<main class="layout">
+<main id="view-market" class="layout">
   <aside class="panel snapshot">
     <h2>当前状态</h2>
     <div id="snapshot-body" class="snapshot-body">
@@ -73,6 +78,7 @@
     <div class="legend">
       <span><i class="badge badge-trend"></i>趋势</span>
       <span><i class="badge badge-event"></i>事件</span>
+      <span><i class="badge badge-world"></i>国际大事</span>
       <span><i class="badge badge-short"></i>做空观察位</span>
       <span><i class="badge badge-session"></i>盘中波动</span>
       <span><i class="badge badge-backfill"></i>日志回填（旧消息）</span>
@@ -87,6 +93,7 @@
         <option value="趋势">趋势</option>
         <option value="事件预警">事件预警</option>
         <option value="事件结果">事件结果</option>
+        <option value="国际大事">国际大事</option>
         <option value="做空观察位">做空观察位</option>
         <option value="盘中波动">盘中波动</option>
       </select>
@@ -94,6 +101,76 @@
     <p id="alerts-summary" class="muted"></p>
     <ul id="alerts-list" class="alerts-list"></ul>
   </aside>
+</main>
+
+<main id="view-control" class="layout control-layout hidden">
+  <section class="panel control-panel">
+    <div class="panel-head">
+      <h2>品种开关</h2>
+      <span id="control-updated" class="muted"></span>
+    </div>
+    <p class="muted small">
+      关掉 = 停止该品种的监控与推送（行情页仍可看 K 线）。
+      若 config 里本来是停用的，这里打开它也会真的开始监控。
+    </p>
+    <ul id="control-symbols" class="control-symbols"></ul>
+  </section>
+
+  <section class="panel control-panel">
+    <div class="panel-head">
+      <h2>消息免打扰</h2>
+      <label class="switch">
+        <input type="checkbox" id="dnd-toggle">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <p class="muted small">
+      开启后，免打扰时段内非重点消息不发送、改为延迟补发（退出时段后自动补上，不会丢）。
+      重点提醒的消息不受影响，照常推送。
+    </p>
+    <div id="dnd-windows" class="dnd-windows"></div>
+    <div class="dnd-add">
+      <input type="time" id="dnd-start" value="23:00">
+      <span class="muted">至</span>
+      <input type="time" id="dnd-end" value="07:00">
+      <input type="text" id="dnd-name" class="text-input" placeholder="备注（可空）">
+      <div class="weekday-picker" id="dnd-weekdays">
+        <label><input type="checkbox" value="0">一</label>
+        <label><input type="checkbox" value="1">二</label>
+        <label><input type="checkbox" value="2">三</label>
+        <label><input type="checkbox" value="3">四</label>
+        <label><input type="checkbox" value="4">五</label>
+        <label><input type="checkbox" value="5">六</label>
+        <label><input type="checkbox" value="6">日</label>
+      </div>
+      <button id="dnd-add-btn" class="btn">添加时段</button>
+    </div>
+    <p id="dnd-status" class="muted small"></p>
+  </section>
+
+  <section class="panel control-panel">
+    <div class="panel-head">
+      <h2>重点提醒</h2>
+    </div>
+    <p class="muted small">
+      重点品种 / 重点轨道：免打扰期间照常推送，标题带【重点】前缀，方便一眼区分。
+    </p>
+    <h3 class="sub">重点品种</h3>
+    <div id="priority-symbols" class="chip-group"></div>
+    <h3 class="sub">重点轨道</h3>
+    <div id="priority-tracks" class="chip-group"></div>
+  </section>
+
+  <section class="panel control-panel">
+    <div class="panel-head">
+      <h2>持仓</h2>
+    </div>
+    <p class="muted small">
+      这里填的持仓会覆盖 config 里的设定，用于计算浮盈浮亏；留空并保存 = 清除覆盖、回到 config。
+      只影响告警文案里的盈亏提醒，不接任何下单接口。
+    </p>
+    <div id="position-forms" class="position-forms"></div>
+  </section>
 </main>
 
 <footer class="footer">

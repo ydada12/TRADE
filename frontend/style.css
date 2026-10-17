@@ -1,5 +1,7 @@
-/* 本地只读面板样式。配色对齐 OKX 暗色行情页：绿涨 #0ecb81 / 红跌 #f6465d。
- * 字体用系统中文字体，避免 Windows 下默认字体发虚。 */
+/* 本地行情面板样式。配色对齐 OKX 暗色行情页：绿涨 #0ecb81 / 红跌 #f6465d。
+ * 字体用系统中文字体，避免 Windows 下默认字体发虚。
+ * 行情页只读展示；「控制」页只改本地监控与推送偏好（品种开关 / 免打扰 / 重点提醒 / 持仓），
+ * 不接交易接口、不下单、不发推送。 */
 
 :root {
   --bg: #16181c;
@@ -15,6 +17,7 @@
   --event: #f59e0b;
   --short: #f6465d;
   --session: #a855f7;
+  --world: #22d3ee;
 }
 
 * { box-sizing: border-box; }
@@ -213,6 +216,7 @@ select:focus, .btn:focus { outline: 1px solid var(--muted); }
 .badge-event { background: var(--event); }
 .badge-short { background: var(--short); }
 .badge-session { background: var(--session); }
+.badge-world { background: var(--world); }
 .badge-backfill { background: #6b7280; }
 
 /* ---------- 历史消息 ---------- */
@@ -234,11 +238,38 @@ select:focus, .btn:focus { outline: 1px solid var(--muted); }
 .alert-item.event { border-left-color: var(--event); }
 .alert-item.short { border-left-color: var(--short); }
 .alert-item.session { border-left-color: var(--session); }
+.alert-item.world { border-left-color: var(--world); }
 .alert-item.backfill { border-left-style: dashed; }
 .alert-head { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
 .alert-title { font-size: 12px; font-weight: 600; margin: 3px 0; }
 .alert-meta { font-size: 11px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; }
 .alert-off { color: var(--event); font-size: 10px; }
+
+/* ---------- 历史消息详情（点开某条消息后展开） ---------- */
+.alert-detail {
+  margin-top: 7px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--border);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.alert-detail-title {
+  font-size: 12px; font-weight: 600; color: var(--text); line-height: 1.45;
+}
+.ad-row { display: flex; gap: 8px; font-size: 11px; }
+.ad-row .k { flex: 0 0 56px; color: var(--muted); }
+.ad-row .v { flex: 1; min-width: 0; word-break: break-word; }
+.ad-happened {
+  font-size: 11px; line-height: 1.55; color: var(--text);
+  border-left: 2px solid var(--border); padding-left: 7px;
+}
+.ad-label { font-size: 10px; letter-spacing: .06em; }
+.ad-body {
+  font-size: 11px; line-height: 1.55; color: var(--muted);
+  white-space: pre-wrap; word-break: break-word;
+  background: var(--panel-3); border-radius: 4px; padding: 7px;
+  max-height: 260px; overflow-y: auto;
+}
+.ad-note { margin: 0; font-size: 10px; }
 
 /* ---------- 底栏 ---------- */
 .footer {
@@ -247,3 +278,131 @@ select:focus, .btn:focus { outline: 1px solid var(--muted); }
   font-size: 11px;
   text-align: center;
 }
+
+/* ================= 顶部标签 ================= */
+.tabs { display: flex; gap: 4px; }
+.tab {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.tab:hover { color: var(--text); background: var(--panel-2); }
+.tab.active {
+  color: var(--text);
+  background: var(--panel-2);
+  border-color: var(--border);
+  font-weight: 600;
+}
+
+/* ================= 控制页 ================= */
+.control-layout {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+}
+@media (max-width: 1100px) { .control-layout { grid-template-columns: 1fr; } }
+
+.control-panel { display: flex; flex-direction: column; gap: 6px; }
+.control-panel .sub {
+  font-size: 11px; color: var(--muted); margin: 6px 0 2px; font-weight: 600;
+}
+.small { font-size: 11px; }
+
+/* ---- 开关 ---- */
+.switch { position: relative; display: inline-block; width: 38px; height: 20px; flex: 0 0 auto; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute; inset: 0; cursor: pointer;
+  background: var(--panel-3); border: 1px solid var(--border);
+  border-radius: 20px; transition: background .15s;
+}
+.slider::before {
+  content: ""; position: absolute; height: 14px; width: 14px; left: 3px; top: 2px;
+  background: var(--muted); border-radius: 50%; transition: transform .15s, background .15s;
+}
+.switch input:checked + .slider { background: rgba(14, 203, 129, .30); border-color: var(--up); }
+.switch input:checked + .slider::before { transform: translateX(17px); background: var(--up); }
+
+/* ---- 品种开关列表 ---- */
+.control-symbols { list-style: none; margin: 0; padding: 0; }
+.control-symbol {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 8px; border: 1px solid var(--border); border-radius: 5px;
+  background: var(--panel-2); margin-bottom: 6px;
+}
+.cs-main { min-width: 0; flex: 1 1 auto; }
+.cs-name { font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.pill-priority {
+  font-size: 10px; color: var(--event);
+  border: 1px solid rgba(245, 158, 11, .5); background: rgba(245, 158, 11, .12);
+  border-radius: 8px; padding: 0 6px;
+}
+
+/* ---- 免打扰 ---- */
+.dnd-windows { display: flex; flex-direction: column; gap: 6px; }
+.dnd-window {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 5px;
+  background: var(--panel-2);
+}
+.dw-name { font-size: 12px; flex: 0 0 auto; }
+.dnd-window .muted:last-of-type { margin-left: auto; }
+.dnd-add {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border);
+}
+input[type="time"], .text-input {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 6px; font-family: inherit; font-size: 12px;
+}
+.text-input { width: 120px; }
+.weekday-picker { display: flex; gap: 4px; }
+.weekday-picker label {
+  display: flex; align-items: center; gap: 3px;
+  font-size: 11px; color: var(--muted); cursor: pointer;
+}
+
+/* ---- 重点提醒 chips ---- */
+.chip-group { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 12px;
+  padding: 3px 11px; font-family: inherit; font-size: 11px; cursor: pointer;
+}
+.chip:hover { color: var(--text); }
+.chip.on {
+  color: var(--event); border-color: rgba(245, 158, 11, .55);
+  background: rgba(245, 158, 11, .12); font-weight: 600;
+}
+
+/* ---- 持仓 ---- */
+.position-forms { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.pos-form {
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--panel-2); padding: 8px;
+}
+.pos-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+.pos-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; }
+.pos-grid label {
+  display: flex; flex-direction: column; gap: 3px;
+  font-size: 11px; color: var(--muted); grid-column: span 3;
+}
+.pos-grid label.pos-note { grid-column: span 12; }
+.pos-grid input, .pos-grid select {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 6px; font-family: inherit; font-size: 12px; width: 100%;
+}
+.pos-actions { display: flex; gap: 6px; margin-top: 8px; }
+.btn-mini {
+  background: var(--panel-3); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 3px 10px; font-family: inherit; font-size: 11px; cursor: pointer;
+}
+.btn-mini:hover { background: var(--panel); }
+.btn-mini.primary { border-color: var(--up); color: var(--up); }

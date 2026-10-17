@@ -140,6 +140,7 @@ class AlertRecord:
     signal_type: str = ""             # 趋势 / 事件 / 做空观察位 / 盘中波动
     title: str = ""                   # 推送标题（原文）
     what_happened: str = ""
+    body: str = ""                    # 推送正文原文，面板上点开某条消息就能看到发出去的全文
     price: float | None = None
     support: float | None = None
     resistance: float | None = None
@@ -158,6 +159,7 @@ class AlertRecord:
             "signal_type": self.signal_type,
             "title": self.title,
             "what_happened": self.what_happened,
+            "body": self.body,
             "price": self.price,
             "support": self.support,
             "resistance": self.resistance,
@@ -188,6 +190,7 @@ class AlertRecord:
             signal_type=_text(raw.get("signal_type")),
             title=_text(raw.get("title")),
             what_happened=_text(raw.get("what_happened")),
+            body=_text(raw.get("body")),
             price=_opt_float(raw.get("price")),
             support=_opt_float(raw.get("support")),
             resistance=_opt_float(raw.get("resistance")),
@@ -223,7 +226,7 @@ def _opt_int(value: Any) -> int | None:
 
 
 def record_from_alert(alert: Any, title: str, fingerprint: str,
-                      source: str = SOURCE_LIVE) -> AlertRecord:
+                      source: str = SOURCE_LIVE, body: str = "") -> AlertRecord:
     """把 Alert / EventAlert 映射成落盘记录（纯函数，好测）。
 
     两者字段名不完全一样：EventAlert 没有 signal_type，也没有 what_happened 以外
@@ -239,6 +242,7 @@ def record_from_alert(alert: Any, title: str, fingerprint: str,
         signal_type=signal_type,
         title=_text(title),
         what_happened=_text(getattr(alert, "what_happened", "")) or _text(getattr(alert, "happened", "")),
+        body=_text(body),
         price=_opt_float(getattr(alert, "price", None)),
         support=_opt_float(getattr(alert, "support", None)),
         resistance=_opt_float(getattr(alert, "resistance", None)),

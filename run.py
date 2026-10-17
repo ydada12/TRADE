@@ -36,6 +36,8 @@ from src.alert import (
     SIGNAL_EVENT,
     SIGNAL_SHORT,
     SIGNAL_TREND,
+    SIGNAL_WORLD,
+    WorldAlert,
     compute_position_pnl,
     fmt_num,
     now_utc8_str,
@@ -45,28 +47,41 @@ from src.alert import (
     zone_hint,
 )
 from src.config import PROJECT_ROOT, Config, load_config
+from src.control import ControlStore, PendingQueue, inst_from_fingerprint
 from src.datasource.econ_calendar import BEIJING, EconCalendarClient, EconEvent
 from src.datasource.okx import Candle, OkxClient
 from src.datasource.us_stock import UsStockClient
-from src.dashboard.history import AlertHistory, record_from_alert
+from src.datasource.world_news import (
+    DEFAULT_GDELT_QUERY,
+    DEFAULT_RSS_FEEDS,
+    NewsItem,
+    WorldNewsClient,
+    normalize_url,
+)
+from src.dashboard.history import AlertHistory, AlertRecord, record_from_alert
 from src.llm.deepseek import DeepSeekClient
 from src.llm.prompts import (
     SYSTEM_PROMPT,
+    WORLD_SYSTEM_PROMPT,
     build_event_post_user_message,
     build_event_pre_user_message,
     build_session_user_message,
     build_short_user_message,
     build_trend_user_message,
+    build_world_judge_user_message,
 )
 from src.logutil import get_logger, setup_logging
 from src.modules.event import (
+    branch_from_previous,
     build_branch_facts,
     categorize,
     determine_branch,
     publish_time_text,
     render_fallback_script,
     render_post_fallback,
+    verdict_for_event,
 )
+from src.modules import world as world_mod
 from src.modules.levels import derive_intraday_levels, derive_levels, detect_level_breaks
 from src.modules.session import (
     UTC8,
@@ -81,43 +96,36 @@ from src.modules.short_signal import compute_orderflow_metrics, score_short_sign
 from src.modules.trend import STATE_LABEL, evaluate_trend
 from src.state import StateStore
 
+# 推送策略层：规则与文案都在 src/strategy/，run.py 只做编排与委托。
+# 这里的常量 import 即「re-export 兼容层」——外部仍可 from run import PUSH_*。
+from src.strategy.deferral import DndDeferral
+from src.strategy.gate import (
+    MAX_PUSH_RETRIES,
+    PUSH_COOLDOWN,
+    PUSH_DEFERRED,
+    PUSH_FAILED,
+    PUSH_SENT,
+    PUSH_SKIPPED,
+    PushGate,
+)
+# 轨道共用的纯计算助手（原 run.py 顶部定义，随轨道搬到 src/strategy/helpers.py）。
+# 调用点沿用旧名 _gap_pct，保持零改动。
+from src.strategy.helpers import bar_minutes, gap_pct as _gap_pct
+from src.strategy.memo import DirectionMemo
+from src.strategy.tracks.event import EventTrack
+from src.strategy.tracks.session import SessionTrack
+from src.strategy.tracks.short import ShortTrack
+from src.strategy.tracks.trend import TrendTrack
+from src.strategy.tracks.world import WorldTrack
+from src.strategy.wording import PRIORITY_PREFIX, STATE_SHORT
+
 log = get_logger("run")
 
-# 标题用的极短状态名（微信通知栏只显示标题）
-STATE_SHORT = {"bull": "多头", "bear": "空头", "range": "震荡", "unknown": "数据不足"}
+
+# push_status 的返回值与最大重试次数由 src/strategy/gate.py 定义并 import（见顶部）。
 
 
-def bar_minutes(bar: str) -> int:
-    """把 OKX 的 bar 字符串（如 5m / 15m / 1H / 1D）换算成分钟数。"""
-    text = (bar or "").strip().lower()
-    if not text:
-        return 5
-    unit = text[-1]
-    try:
-        value = int(float(text[:-1]))
-    except ValueError:
-        return 5
-    if unit == "m":
-        return value
-    if unit == "h":
-        return value * 60
-    if unit == "d":
-        return value * 1440
-    if unit == "w":
-        return value * 7 * 1440
-    return 5
-
-
-# push_status 的返回值
-PUSH_SENT = "sent"          # 已发送
-PUSH_COOLDOWN = "cooldown"  # 冷却中，按配置跳过（不是失败）
-PUSH_FAILED = "failed"      # 发送失败，用户没收到
-PUSH_SKIPPED = "skipped"    # 没有可推送的内容（例如事件没有关联品种）
-# 同一条信号推送连续失败多少次后放弃重试
-MAX_PUSH_RETRIES = 5
-
-
-class Monitor:
+class Monitor(DirectionMemo, TrendTrack, EventTrack, WorldTrack, SessionTrack, ShortTrack):
     def __init__(self, cfg: Config, dry_run: bool = False) -> None:
         self.cfg = cfg
         self.app = cfg.get("app", {}) or {}
@@ -133,6 +141,16 @@ class Monitor:
         self.history = AlertHistory(cfg.resolve_path(
             str(self.app.get("alert_history_file", "state/alerts.jsonl"))
         ))
+
+        # 运行期控制项（本地控制台写入，这里每轮重读）。放 state/ 下，不进公开仓库。
+        self.control = ControlStore(
+            cfg.resolve_path(str(self.app.get("control_file", "state/control.json"))),
+            valid_inst_ids=[str(s.get("inst_id")) for s in cfg.symbols],
+        )
+        # 免打扰期间被「延迟补发」的信号队列（落盘，跨进程重启也不丢）
+        self.pending = PendingQueue(
+            cfg.resolve_path(str(self.app.get("pending_file", "state/pending.json")))
+        )
 
         market = cfg.get("market", {}) or {}
         self.okx = OkxClient(
@@ -196,11 +214,14 @@ class Monitor:
         self.calendar_cache_seconds = float(cal_cfg.get("cache_minutes", 30)) * 60
         self.calendar_hot_cache_seconds = float(cal_cfg.get("hot_cache_minutes", 3)) * 60
         self._calendar_cache: tuple[float, list[EconEvent]] | None = None
+        # 已经提醒过「公布了但数据源还没给实际值」的事件，避免每轮重复刷日志
+        self._post_pending_warned: set[str] = set()
         self.calendar = EconCalendarClient(
             days_ahead=int(cal_cfg.get("days_ahead", 7)),
             min_importance=int(cal_cfg.get("min_importance", 2)),
             keywords=list(cal_cfg.get("keywords", []) or []),
             regions=list(cal_cfg.get("regions", []) or []),
+            lookback_days=int(cal_cfg.get("lookback_days", 1)),
         )
 
         # ---- 重点时段盘中波动监控 ----
@@ -242,69 +263,134 @@ class Monitor:
             "score_threshold": int(short_cfg.get("score_threshold", 4)),
         }
 
-    # ================= 推送 =================
+        # ---- 国际大事轨（GDELT 主 + RSS 辅；DeepSeek 研判 + 确定性兜底）----
+        world_cfg = cfg.get("world_events", {}) or {}
+        self.world_cfg = world_cfg
+        self.world_enabled = bool(world_cfg.get("enabled", True))
+        self.world_interval = float(world_cfg.get("interval_minutes", 20)) * 60
+        self.world_cache_seconds = float(world_cfg.get("cache_minutes", 15)) * 60
+        self._world_cache: tuple[float, list[NewsItem]] | None = None
+        self._world_last_judge = 0.0
+        self.world_per_run = int(world_cfg.get("max_pushes_per_run", 3))
+        self.world_per_day = int(world_cfg.get("max_pushes_per_day", 6))
+        self.world_judge_batch = int(world_cfg.get("judge_batch", 12))
+        # 国际大事是一次性返回整批 JSON（含每条的事实/传导链/思考），
+        # 12 条 × 每条两百来个 token 远超通用的 800 上限；上限太小会让回复被截断成
+        # 非法 JSON，整批退回规则兜底、一条 AI 思考都发不出去。
+        self.world_judge_max_tokens = int(world_cfg.get("judge_max_tokens", 3000))
+        self.world_min_score = int(world_cfg.get("min_score", 2))
+        self.world_require_title_hit = bool(world_cfg.get("require_title_hit", True))
+        groups_cfg = world_cfg.get("keyword_groups")
+        self.world_keyword_groups = (
+            dict(groups_cfg) if isinstance(groups_cfg, dict) and groups_cfg
+            else world_mod.DEFAULT_KEYWORD_GROUPS
+        )
+        self.world_watch = list(world_cfg.get("watch_symbols") or [])
+
+        # ---- 跨轨方向备忘（仅内存，不落盘）----
+        # 方向备忘的规则与文案在 src/strategy/memo.py（含有效期 _dir_memo_hours）。
+        self._dir_memo: dict[str, dict[str, Any]] = {}
+
+        # ---- 推送策略层：闸口与延迟补发队列（注入下面这些同实例）----
+        # 关键：以下对象必须与 Monitor 持有的是【同一个】实例，否则
+        # 测试里 `m.control.is_dnd_active = ...` 之类的 monkeypatch 会失效。
+        self._deferral = DndDeferral(
+            state=self.state,
+            notifier=self.notifier,
+            history=self.history,
+            pending=self.pending,
+            make_record=record_from_alert,
+            record_from_line=AlertRecord.from_line,
+        )
+        self._gate = PushGate(
+            state=self.state,
+            control=self.control,
+            notifier=self.notifier,
+            history=self.history,
+            safety=self.safety,
+            deferral=self._deferral,
+            dry_run=lambda: self.dry_run,
+            cooldown_minutes=self.cooldown_minutes,
+            make_record=record_from_alert,
+        )
+
+        gdelt_cfg = world_cfg.get("gdelt", {}) or {}
+        rss_cfg = world_cfg.get("rss", {}) or {}
+        self.world_news = WorldNewsClient(
+            gdelt_query=str(gdelt_cfg.get("query", DEFAULT_GDELT_QUERY)),
+            rss_feeds=list(rss_cfg.get("feeds") or DEFAULT_RSS_FEEDS),
+            timespan_hours=int(world_cfg.get("timespan_hours", 12)),
+            timeout=float(world_cfg.get("timeout_seconds", 20)),
+            gdelt_maxrecords=int(gdelt_cfg.get("maxrecords", 75)),
+            gdelt_retries=int(gdelt_cfg.get("retries", 2)),
+        )
+        if not bool(gdelt_cfg.get("enabled", True)):
+            def _gdelt_disabled() -> list[NewsItem]:
+                raise RuntimeError("GDELT 已在配置中禁用")
+            self.world_news.fetch_gdelt = _gdelt_disabled  # type: ignore[assignment]
+        if not bool(rss_cfg.get("enabled", True)):
+            self.world_news.rss_feeds = []
+
+    # ================= 推送（委托给 src/strategy/gate.py） =================
     def push_status(self, title: str, body: str, fingerprint: str,
                     force: bool = False, cooldown_minutes: float | None = None,
-                    alert: Alert | EventAlert | None = None) -> str:
-        """推送并返回结果：PUSH_SENT / PUSH_COOLDOWN / PUSH_FAILED。
+                    alert: Alert | EventAlert | WorldAlert | None = None,
+                    track: str | None = None, inst_id: str | None = None) -> str:
+        """推送并返回结果：PUSH_SENT / PUSH_COOLDOWN / PUSH_FAILED / PUSH_DEFERRED。
 
-        调用方必须区分「冷却中跳过」和「真的发送失败」：
-        前者说明这条信号刚推过，可以放心记为已处理；
-        后者说明用户根本没收到，不能把状态记成已处理，否则这条信号永远丢了。
-
-        alert：可选。传了就在**推送成功之后**把它结构化落盘（面板标注 K 线用）。
-        冷却跳过不写（早写过），发送失败不写（用户没收到）。
+        规则（冷却 / 免打扰 / 重点标记 / 落历史）见 src/strategy/gate.py。
         """
-        body = sanitize_for_push(body)
-        body = self.safety.ensure_disclaimer(body)
-
-        cooldown = self.cooldown_minutes if cooldown_minutes is None else cooldown_minutes
-        if not force:
-            cooling, remaining = self.state.is_in_cooldown(fingerprint, cooldown)
-            if cooling:
-                log.info(
-                    "信号 %s 处于冷却期，剩余 %.0f 分钟，跳过推送", fingerprint, remaining / 60
-                )
-                return PUSH_COOLDOWN
-
-        result = self.notifier.send(title, body)
-        if result.ok:
-            self.state.mark_sent(fingerprint)
-            self.state.save()
-            log.info("已推送：%s", title)
-            if alert is not None:
-                self.history.append(record_from_alert(alert, title, fingerprint))
-            return PUSH_SENT
-        log.error("推送失败：%s -> %s", title, result.detail)
-        return PUSH_FAILED
+        return self._gate.push_status(
+            title, body, fingerprint, force=force, cooldown_minutes=cooldown_minutes,
+            alert=alert, track=track, inst_id=inst_id,
+        )
 
     def push(self, title: str, body: str, fingerprint: str,
              force: bool = False, cooldown_minutes: float | None = None,
              alert: Alert | EventAlert | None = None) -> bool:
         """兼容旧调用：只在真的发出去时返回 True。"""
-        return self.push_status(title, body, fingerprint, force, cooldown_minutes,
-                                alert) == PUSH_SENT
+        return self._gate.push(title, body, fingerprint, force, cooldown_minutes, alert)
 
     def _delivery_settled(self, retry_key: str, status: str, force: bool) -> bool:
-        """这条信号算不算「处理完了」（可以落状态/标记已发）。
+        """这条信号算不算「处理完了」（可以落状态/标记已发）。见 src/strategy/gate.py。"""
+        return self._gate._delivery_settled(retry_key, status, force)
 
-        已发送、冷却中、跳过：处理完了。
-        发送失败：不算，下一轮重试；累计失败 MAX_PUSH_RETRIES 次后放弃，
-        避免 Server酱长时间故障时每一轮都白白重算、重调大模型。
-        手动 --force 的失败不重试（用户在场，自己看得到）。
-        """
-        if status != PUSH_FAILED or force:
-            self.state.clear_retry(retry_key)
-            return True
-        attempts = self.state.bump_retry(retry_key)
-        if attempts >= MAX_PUSH_RETRIES:
-            log.error("信号 %s 连续推送失败 %s 次，放弃重试", retry_key, attempts)
-            self.state.clear_retry(retry_key)
-            return True
-        log.warning("信号 %s 推送失败（第 %s/%s 次），状态未落盘，下一轮重试",
-                    retry_key, attempts, MAX_PUSH_RETRIES)
-        self.state.save()
-        return False
+    # ================= 运行期控制项（本地控制台） =================
+    def reload_control(self) -> None:
+        """每轮/每次轨道执行前重读控制项，让本地控制台的改动能即刻生效。"""
+        try:
+            self.control.reload()
+        except Exception as exc:  # pragma: no cover - 防御性
+            log.error("控制项重读失败，沿用已加载的值：%s", exc)
+
+    def _active_symbols(self) -> list[dict]:
+        """当前参与监控的品种 = config 默认，叠加控制台的逐品种覆盖。"""
+        out: list[dict] = []
+        for symbol in self.cfg.symbols:
+            inst_id = str(symbol.get("inst_id") or "")
+            override = self.control.symbol_override(inst_id) if inst_id else None
+            enabled = bool(symbol.get("enabled", True)) if override is None else override
+            if enabled:
+                out.append(symbol)
+        return out
+
+    def _effective_position(self, symbol: dict) -> dict:
+        """持仓：控制台填过就用控制台的，否则用 config 里的真实持仓。"""
+        inst_id = str(symbol.get("inst_id") or "")
+        override = self.control.position(inst_id) if inst_id else None
+        if override is not None:
+            return override
+        return symbol.get("position") or {}
+
+    # ---- 免打扰延迟补发（委托给 src/strategy/deferral.py）----
+    def _defer_push(self, track: str | None, inst_id: str | None, title: str, body: str,
+                    fingerprint: str, alert: Alert | EventAlert | WorldAlert | None) -> None:
+        """免打扰期间的信号：不发、也不丢，进延迟队列等退出免打扰后补发。"""
+        self._deferral.defer_push(track, inst_id, title, body, fingerprint, alert)
+
+    def _flush_pending(self) -> int:
+        """退出免打扰后补发延迟队列。返回本轮补发成功条数。见 src/strategy/deferral.py。"""
+        return self._deferral.flush_pending()
 
     # ================= 周K来源调度 =================
     # 拉取失败时，最多容忍用多久以前的旧周K（周线指标变化很慢，旧数据比没数据强）
@@ -381,269 +467,7 @@ class Monitor:
             "breached": abs(divergence_pct) > threshold,
         }
 
-    # ================= 趋势轨 =================
-    def run_trend(self, force: bool = False, only: str | None = None) -> list[str]:
-        messages: list[str] = []
-        trend_cfg = self.cfg.get("trend", {}) or {}
-        rules = trend_cfg.get("rules", {}) or {}
-        only_on_change = bool(trend_cfg.get("only_alert_on_state_change", True))
-
-        for symbol in self.cfg.enabled_symbols():
-            inst_id = symbol["inst_id"]
-            if only and inst_id != only:
-                continue
-            name = symbol.get("name", inst_id)
-            inst_type = symbol.get("inst_type", "SWAP")
-            ma_periods = [int(p) for p in (symbol.get("ma_periods") or [20])]
-            cross_pairs = symbol.get("cross_pairs") or []
-
-            try:
-                if self.okx.get_instrument(inst_id, inst_type) is None:
-                    log.error("%s 在 OKX 上不存在，请检查 config 里的 inst_id", inst_id)
-                    continue
-                ticker = self.okx.get_ticker(inst_id)
-                candles, history_desc = self._weekly_candles(symbol)
-            except Exception as exc:
-                log.error("%s 行情获取失败（本轮跳过，下轮重试）：%s", inst_id, exc)
-                continue
-
-            if not candles:
-                log.error("%s 没拉到任何周K，跳过", inst_id)
-                continue
-
-            divergence = self._divergence_warning(symbol, candles, ticker.last)
-
-            prev = self.state.get_trend_state(inst_id)
-            prev_state = (prev or {}).get("state")
-
-            snapshot = evaluate_trend(
-                inst_id=inst_id,
-                name=name,
-                candles=candles,
-                last_price=ticker.last,
-                ma_periods=ma_periods,
-                cross_pairs=cross_pairs,
-                primary_ma=str(trend_cfg.get("primary_ma", "fast")),
-                tolerance_pct=float(trend_cfg.get("break_tolerance_pct", 0.3)),
-                prev_state=prev_state,
-                price_vs_ma=bool(rules.get("price_vs_ma", True)),
-                ma_cross=bool(rules.get("ma_cross", True)),
-            )
-
-            levels_cfg = symbol.get("levels", {}) or {}
-            levels = derive_levels(
-                inst_id=inst_id,
-                candles=[c for c in candles if c.confirmed],
-                current_price=ticker.last,
-                lookback_weeks=int(levels_cfg.get("lookback_weeks", 12)),
-                manual_support=levels_cfg.get("manual_support"),
-                manual_resistance=levels_cfg.get("manual_resistance"),
-                min_distance_pct=float(levels_cfg.get("min_distance_pct", 1.5)),
-            )
-            breaks = detect_level_breaks(
-                levels=levels,
-                current_price=ticker.last,
-                prev_close=snapshot.close,
-                tolerance_pct=float(trend_cfg.get("break_tolerance_pct", 0.3)),
-            )
-
-            new_record = {
-                "state": snapshot.state,
-                "as_of_week": snapshot.as_of_week,
-                "close": snapshot.close,
-                "ma_values": {str(k): v for k, v in snapshot.ma_values.items()},
-                "updated_at": now_utc8_str(),
-            }
-
-            for note in snapshot.insufficient:
-                log.warning("%s 数据不足提示：%s", inst_id, note)
-
-            # only_alert_on_state_change=false 时每轮都进入推送流程（由冷却去重）
-            should_alert = snapshot.state_changed or force or not only_on_change
-            if not should_alert:
-                # 没有要送达的东西，状态直接记下
-                self.state.set_trend_state(inst_id, new_record)
-                self.state.save()
-                log.info(
-                    "%s 趋势状态未变化（%s），按配置不推送", inst_id, snapshot.state
-                )
-                continue
-
-            fp = f"trend|{inst_id}|{snapshot.state}"
-            try:
-                body = self._build_trend_alert(symbol, snapshot, levels, breaks, ticker,
-                                               history_desc, divergence)
-                # 面板标注用：钉住品种与「当时看到的价」对应的时间
-                body.inst_id = inst_id
-                body.ts_ms = ticker.ts_ms
-                status = self.push_status(body.title(), body.render(), fp, force=force,
-                                          alert=body)
-            except Exception:
-                log.error("%s 趋势告警生成/推送异常：\n%s", inst_id, traceback.format_exc())
-                status = PUSH_FAILED
-
-            # 推送失败时不落新状态：下一轮 state_changed 仍为真，会自动重试，
-            # 否则「状态已更新但用户没收到」这次切换就永远丢了。
-            if not self._delivery_settled(f"retry|{fp}", status, force):
-                continue
-            self.state.set_trend_state(inst_id, new_record)
-            self.state.save()
-            if status == PUSH_SENT:
-                messages.append(body.render())
-        return messages
-
-    def _build_trend_alert(self, symbol: dict, snapshot, levels, breaks, ticker,
-                           history_desc: str = "OKX 周K",
-                           divergence: dict | None = None) -> Alert:
-        inst_id = snapshot.inst_id
-
-        trigger_bits: list[str] = []
-        for signal in snapshot.signals:
-            trigger_bits.append(signal.text)
-        if not trigger_bits:
-            if snapshot.prev_state is None:
-                trigger_bits.append(
-                    f"首次建立趋势基线：当前趋势状态为「{snapshot.state_label}」"
-                )
-            elif snapshot.prev_state == snapshot.state:
-                # 强制/手动查询时状态并未变化，不能写成「由 X 变为 X」
-                trigger_bits.append(
-                    f"当前趋势状态维持「{snapshot.state_label}」不变（本次为手动查询）"
-                )
-            else:
-                trigger_bits.append(
-                    f"趋势状态由「{snapshot.prev_state_label}」变为「{snapshot.state_label}」"
-                )
-        for brk in breaks:
-            trigger_bits.append(brk["text"])
-        trigger = "；".join(trigger_bits)
-
-        pnl = compute_position_pnl(symbol.get("position") or {}, ticker.last)
-        extra_lines: list[str] = [
-            f"【周线均线】{snapshot.render_ma()}",
-            f"【历史数据来源】{history_desc}｜已收盘周K {snapshot.weeks_available} 根",
-        ]
-        if divergence:
-            line = (
-                f"【跟踪偏差】美股周收盘 {fmt_num(divergence['us_close'])}"
-                f"（{divergence['us_week']}）vs OKX 现价 {fmt_num(ticker.last)}"
-                f"，偏离 {divergence['divergence_pct']:+.2f}%"
-            )
-            if divergence["breached"]:
-                line += f" ⚠ 已超过你设的 {divergence['threshold']:g}% 阈值，请人工确认两个市场是否仍同步"
-            extra_lines.append(line)
-        extra_lines.append(
-            f"【关键位来源】{'配置指定' if levels.source == 'manual' else '由真实周K算法推导'}"
-            f"（近 {levels.lookback_weeks} 周高低点）"
-        )
-        if snapshot.insufficient:
-            extra_lines.append("【数据提示】" + "；".join(snapshot.insufficient))
-        if pnl:
-            extra_lines.append(render_position_line(pnl))
-
-        fallback = self._trend_fallback_text(snapshot, levels, breaks, pnl)
-
-        facts: dict[str, Any] = {
-            "品种": snapshot.name,
-            "品种代码": inst_id,
-            "信号类型": SIGNAL_TREND,
-            "已收盘周K(北京时间周)": snapshot.as_of_week,
-            "周线收盘价": snapshot.close,
-            "实时最新价": ticker.last,
-            "最新价UTC时间": ticker.fetched_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            "均线": {f"MA{k}": v for k, v in snapshot.ma_values.items()},
-            "均线方向": {f"MA{k}": ("向上" if v else "向下" if v is False else "未知")
-                     for k, v in snapshot.ma_rising.items()},
-            "已收盘周K数量": snapshot.weeks_available,
-            "数据不足说明": snapshot.insufficient,
-            "趋势状态": snapshot.state_label,
-            "上一次趋势状态": snapshot.prev_state_label,
-            "触发条件": trigger,
-            "支撑位": levels.nearest_support(),
-            "压力位": levels.nearest_resistance(),
-            "支撑位列表": levels.supports[:6],
-            "压力位列表": levels.resistances[:6],
-            "破位情况": [b["text"] for b in breaks],
-            "历史数据来源": history_desc,
-        }
-        if divergence:
-            facts["与美股跟踪偏差%"] = round(divergence["divergence_pct"], 2)
-            facts["美股最新周收盘"] = divergence["us_close"]
-        if pnl:
-            facts["你的持仓"] = {
-                "方向": "多单" if pnl.side == "long" else "空单",
-                "开仓价": pnl.entry_price,
-                "保证金U": pnl.margin_usdt,
-                "杠杆": pnl.leverage,
-                "浮动盈亏U": round(pnl.unrealized, 4),
-                "保证金收益率%": round(pnl.roe_pct, 2),
-            }
-
-        ai_text, source = self.llm.translate(
-            SYSTEM_PROMPT, build_trend_user_message(facts), facts, fallback
-        )
-        if source != "deepseek":
-            ai_text = f"{fallback}（说明：本条解读由本地规则模板生成）"
-
-        safe_text, blocked = self.safety.sanitize_ai_text(ai_text, fallback)
-        support = levels.nearest_support()
-        resistance = levels.nearest_resistance()
-        happened = trigger
-        action = f"{self.safety.enforce_action('')} —— {zone_hint(ticker.last, support, resistance)}"
-
-        state_short = STATE_SHORT.get(snapshot.state, snapshot.state)
-        if snapshot.prev_state is None:
-            title_hint = f"趋势基线：{state_short}"
-        elif snapshot.prev_state == snapshot.state:
-            title_hint = f"趋势{state_short}未变"
-        else:
-            title_hint = (
-                f"趋势{STATE_SHORT.get(snapshot.prev_state, snapshot.prev_state)}"
-                f"→{state_short}"
-            )
-
-        return Alert(
-            symbol=f"{snapshot.name}（{inst_id}）",
-            short_name=short_symbol(inst_id, snapshot.name),
-            title_hint=title_hint,
-            what_happened=happened,
-            time_text=(
-                f"{ticker.fetched_at_utc.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间"
-                f" / {ticker.fetched_at_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                f"（来源 OKX ticker）"
-            ),
-            price=ticker.last,
-            support=support,
-            resistance=resistance,
-            action_text=action,
-            ai_text=safe_text,
-            signal_type=SIGNAL_TREND,
-            extra_lines=extra_lines,
-            disclaimer=self.safety.disclaimer,
-        )
-
-    @staticmethod
-    def _trend_fallback_text(snapshot, levels, breaks, pnl) -> str:
-        break_text = ""
-        if breaks:
-            break_text = "，".join(b["text"] for b in breaks) + "。"
-        if snapshot.prev_state is None:
-            change_text = f"本次为首轮基线记录，趋势判定为「{snapshot.state_label}」。"
-        elif snapshot.prev_state == snapshot.state:
-            change_text = (
-                f"趋势判定为「{snapshot.state_label}」，"
-                f"与上一次记录的状态一致，尚未发生变化。"
-            )
-        else:
-            change_text = (
-                f"趋势判定为「{snapshot.state_label}」，"
-                f"较上一次「{snapshot.prev_state_label}」已发生变化。"
-            )
-        return (
-            f"周线收盘 {fmt_num(snapshot.close)}，{snapshot.render_ma()}，"
-            f"{change_text}"
-            f"{break_text}历史上这类均线状态切换后，通常需要观察价格能否在新位置站稳，而不是立刻下结论。"
-        )
+    # 趋势轨（run_trend / _build_trend_alert / _trend_fallback_text）由 src/strategy/tracks/trend.py 的 TrendTrack mixin 提供。
 
     # ================= 事件轨 =================
     def run_events(self, force: bool = False,
@@ -660,6 +484,9 @@ class Monitor:
             else event_cfg.get("pre_alert_minutes", 180)
         )
         post_minutes = float(event_cfg.get("post_check_minutes", 20))
+        # 「对号入座」的观察窗上限。数据源的「公布」列常滞后几十分钟到几小时才填上
+        # （晚间的美国数据经常要跨过零点），窗口开得太小会永远等不到实际值。
+        post_window_minutes = max(post_minutes, float(event_cfg.get("post_max_minutes", 1440)))
         max_events = int(
             max_events_override
             if max_events_override is not None
@@ -708,7 +535,14 @@ class Monitor:
 
             # ---------- 发布后：对号入座 ----------
             minutes_since = -minutes_to_publish
-            if 0 <= minutes_since <= max(post_minutes, 240) and event.released:
+            if 0 <= minutes_since <= post_window_minutes and not event.released:
+                # 数据源的实际值常滞后几十分钟到几小时。这里只记一次，别让「没等到值」
+                # 变成无声无息——出问题时至少能在日志里看到它一直在等。
+                if minutes_since >= 60 and fp not in self._post_pending_warned:
+                    self._post_pending_warned.add(fp)
+                    log.warning("事件 %s 已公布 %.0f 分钟，数据源仍未给出实际值（继续等，最多等 %.0f 分钟）",
+                                event.name, minutes_since, post_window_minutes)
+            if 0 <= minutes_since <= post_window_minutes and event.released:
                 record = self.state.get_event(fp) or {}
                 if record.get("post_sent") and not force:
                     continue
@@ -781,581 +615,40 @@ class Monitor:
             return False
         return self.calendar.is_watched(event)
 
-    def _target_symbols(self, watch: list[str]) -> list[dict]:
-        symbols = self.cfg.enabled_symbols()
-        if not watch:
-            return symbols
-        return [s for s in symbols if s.get("inst_id") in watch]
+    # 事件轨的规则与文案（_target_symbols / _primary_symbol_for_event / _symbol_levels / _emit_pre_script / _emit_post_result）由 src/strategy/tracks/event.py 的 EventTrack mixin 提供。
 
-    def _primary_symbol_for_event(self, event: EconEvent, watch: list[str]) -> dict | None:
-        """按事件类别挑最相关的品种。
-
-        原油库存挂到 CL，通胀/就业挂到纳指，避免「EIA 库存」配纳指支撑位的笑话。
-        """
-        symbols = self._target_symbols(watch)
-        if not symbols:
-            return None
-        event_cfg = self.cfg.get("event", {}) or {}
-        mapping = event_cfg.get("symbol_by_category") or {}
-        target_id = mapping.get(categorize(event.name)) or event_cfg.get("default_symbol")
-        if target_id:
-            for symbol in symbols:
-                if symbol.get("inst_id") == target_id:
-                    return symbol
-        return symbols[0]
-
-    def _symbol_levels(self, symbol: dict) -> tuple[dict | None, float | None, str, int | None]:
-        """取该品种的真实行情 + 支撑压力位（周K来源与趋势轨保持一致）。
-
-        返回 (关键位字典, 最新价, 数据时间文本, 数据时间 epoch ms)。
-        最后一个值是给面板标注 K 线用的，行情拿不到时为 None。
-        """
-        inst_id = symbol["inst_id"]
+    # ================= 国际大事（GDELT + RSS） =================
+    def _world_items(self, force: bool = False) -> list[NewsItem]:
+        """国际新闻（带缓存）。刷新失败时回退旧缓存，与经济日历同口径。"""
+        cached = self._world_cache
+        if cached and not force and time.time() - cached[0] < self.world_cache_seconds:
+            return cached[1]
         try:
-            ticker = self.okx.get_ticker(inst_id)
-            candles, _ = self._weekly_candles(symbol)
-        except Exception as exc:
-            log.error("事件轨：%s 行情获取失败：%s", inst_id, exc)
-            return None, None, "", None
-        confirmed = [c for c in candles if c.confirmed]
-        if not confirmed:
-            return None, None, "", None
-        levels_cfg = symbol.get("levels", {}) or {}
-        levels = derive_levels(
-            inst_id=inst_id,
-            candles=confirmed,
-            current_price=ticker.last,
-            lookback_weeks=int(levels_cfg.get("lookback_weeks", 12)),
-            manual_support=levels_cfg.get("manual_support"),
-            manual_resistance=levels_cfg.get("manual_resistance"),
-            min_distance_pct=float(levels_cfg.get("min_distance_pct", 1.5)),
-        )
-        return (levels.as_dict(), ticker.last,
-                ticker.fetched_at_utc.strftime("%Y-%m-%d %H:%M:%S"), ticker.ts_ms)
+            items, sources = self.world_news.fetch_all()
+        except Exception:
+            if cached:
+                log.warning("国际大事源刷新失败，沿用 %.0f 分钟前的缓存",
+                            (time.time() - cached[0]) / 60)
+                return cached[1]
+            raise
+        self._world_cache = (time.time(), items)
+        log.info("国际大事取数完成：%d 条（来源 %s）", len(items), sources)
+        return items
 
-    def _emit_pre_script(self, event: EconEvent, now: datetime, watch: list[str],
-                         fp: str, force: bool) -> str:
-        """生成并推送公布前剧本，返回 PUSH_* 状态。"""
-        primary = self._primary_symbol_for_event(event, watch)
-        if primary is None:
-            log.warning("事件 %s 没有可关联的品种，跳过", event.name)
-            return PUSH_SKIPPED
-        levels_dict, last_price, ts, ts_ms = self._symbol_levels(primary)
-        facts = build_branch_facts(event, primary, levels_dict)
-        facts["当前价"] = last_price
-        facts["当前价时间"] = ts
-
-        fallback = render_fallback_script(facts, primary["inst_id"], region=event.region)
-        ai_text, source = self.llm.translate(
-            SYSTEM_PROMPT, build_event_pre_user_message(facts), facts, fallback
-        )
-        if source != "deepseek":
-            ai_text = fallback
-        body, blocked = self.safety.sanitize_ai_text(ai_text, fallback)
-
-        alert = EventAlert(
-            headline=event.name,
-            stage="pre",
-            happened=(
-                f"{event.name} 将于 {publish_time_text(event, now)} 公布，"
-                f"提前给你三分支预案"
-            ),
-            time_text=f"{event.date} {event.time} 北京时间（公布时间，来源 AKShare 经济日历）",
-            body=body,
-            symbol=f"{primary.get('name')}（{primary['inst_id']}）",
-            short_name=short_symbol(primary["inst_id"], primary.get("name", "")),
-            title_hint=f"{event.name[:14]} 即将公布",
-            price=last_price,
-            support=(levels_dict or {}).get("nearest_support"),
-            resistance=(levels_dict or {}).get("nearest_resistance"),
-            action_text=(
-                f"{self.safety.enforce_action('')} —— "
-                f"先定好三个分支各自对应哪个价位，等数据出来对号入座"
-            ),
-            forecast_text=event.forecast_text(),
-            previous_text=event.previous_text(),
-            disclaimer=self.safety.disclaimer,
-            extra_lines=[f"【重要性】{event.importance_text()}"],
-            inst_id=primary["inst_id"],
-            ts_ms=ts_ms,
-        )
-        log.info("事件预警：%s 公布时间 %s", event.name, publish_time_text(event, now))
-        return self.push_status(alert.title(), alert.render(), f"{fp}|pre", force=force,
-                                alert=alert)
-
-    def _emit_post_result(self, event: EconEvent, now: datetime, watch: list[str],
-                          fp: str, force: bool) -> str:
-        """生成并推送公布后结果，返回 PUSH_* 状态。"""
-        branch, reason = determine_branch(event.actual, event.forecast, event.previous)
-        primary = self._primary_symbol_for_event(event, watch)
-        if primary is None:
-            log.warning("事件 %s 没有可关联的品种，跳过", event.name)
-            return PUSH_SKIPPED
-        status = PUSH_SKIPPED
-        targets = [primary]
-        for symbol in targets:
-            levels_dict, last_price, ts, ts_ms = self._symbol_levels(symbol)
-            facts = build_branch_facts(event, symbol, levels_dict)
-            facts["当前价"] = last_price
-            facts["当前价时间"] = ts
-            facts["判定分支"] = branch
-            facts["判定依据"] = reason
-
-            fallback = render_post_fallback(branch, reason, event, levels_dict, last_price)
-            ai_text, source = self.llm.translate(
-                SYSTEM_PROMPT, build_event_post_user_message(facts), facts, fallback
-            )
-            if source != "deepseek":
-                ai_text = fallback
-            body, _ = self.safety.sanitize_ai_text(ai_text, fallback)
-
-            alert = EventAlert(
-                headline=event.name,
-                stage="post",
-                happened=reason,
-                time_text=(
-                    f"{event.date} {event.time} 北京时间公布"
-                    f"　数据时间 {ts} UTC（来源 AKShare + OKX）"
-                ),
-                body=body,
-                symbol=f"{symbol.get('name')}（{symbol['inst_id']}）",
-                short_name=short_symbol(symbol["inst_id"], symbol.get("name", "")),
-                title_hint=f"落在剧本{branch}",
-                price=last_price,
-                support=(levels_dict or {}).get("nearest_support"),
-                resistance=(levels_dict or {}).get("nearest_resistance"),
-                action_text=(
-                    f"{self.safety.enforce_action('')} —— "
-                    + zone_hint(last_price,
-                                (levels_dict or {}).get("nearest_support"),
-                                (levels_dict or {}).get("nearest_resistance"))
-                ),
-                forecast_text=event.forecast_text(),
-                previous_text=event.previous_text(),
-                disclaimer=self.safety.disclaimer,
-                extra_lines=[
-                    f"【实际值】{event.actual_text()}　【预期值】{event.forecast_text()}　"
-                    f"【前值】{event.previous_text()}",
-                ],
-                inst_id=symbol["inst_id"],
-                ts_ms=ts_ms,
-            )
-            log.info("事件结果：%s 判定分支 %s", event.name, branch)
-            status = self.push_status(
-                alert.title(), alert.render(), f"{fp}|post|{symbol['inst_id']}", force=force,
-                alert=alert,
-            )
-        return status
+    # 国际大事轨（_world_actions / run_world_events）由 src/strategy/tracks/world.py 的 WorldTrack mixin 提供。
 
     # ================= 重点时段盘中波动 =================
     def current_window(self, now_bj: datetime | None = None):
         now_bj = now_bj or datetime.now(BEIJING)
         return active_window(self.session_windows, now_bj)
 
-    def run_session_watch(self, force: bool = False, ignore_window: bool = False,
-                          now_bj: datetime | None = None) -> list[str]:
-        """重点时段内监测盘中大幅波动。
-
-        force         = 绕过冷却
-        ignore_window = 无视时段限制（用于手动测试）
-        """
-        if not self.session_enabled and not force and not ignore_window:
-            return []
-
-        now_bj = now_bj or datetime.now(BEIJING)
-        window = self.current_window(now_bj)
-        if window is None and not ignore_window:
-            return []
-        window_label = window.label() if window else "手动触发（不在配置时段内）"
-
-        messages: list[str] = []
-        for symbol in self.cfg.enabled_symbols():
-            inst_id = symbol["inst_id"]
-            try:
-                ticker = self.okx.get_ticker(inst_id)
-                candles = self.okx.get_candles(inst_id, self.session_bar, self.session_limit)
-            except Exception as exc:
-                log.error("盘中监控：%s 行情获取失败（跳过）：%s", inst_id, exc)
-                continue
-            if not candles:
-                continue
-
-            since_open_ms = None
-            window_start_ts: int | None = None
-            if window is not None:
-                since_open_ms = int(window.start_moment(now_bj).timestamp() * 1000)
-                window_start_ts = since_open_ms // 1000
-
-            hits = detect_moves(
-                candles=candles,
-                now_ms=ticker.ts_ms,
-                rules=self.session_rules,
-                since_open_ms=since_open_ms,
-                since_open_pct=self.session_since_open_pct,
-            )
-            if not hits:
-                log.info("盘中监控：%s 时段[%s]内无超阈值波动", inst_id, window_label)
-                continue
-
-            levels_dict, _, _, _ = self._symbol_levels(symbol)
-
-            # ---- 防刷屏：幅度分档 + 升级即报 + 冷却（逻辑在 session.decide_alert，可测）----
-            biggest = max(abs(h["change_pct"]) for h in hits)
-            state_key = f"{inst_id}|{window_label}"
-            # 记录只在同一次时段开启内有效，跨天/换时段自动清零（见 record_for_window）
-            record = record_for_window(self.state.get_session(state_key), window_start_ts)
-            decision = decide_alert(
-                biggest_pct=biggest,
-                last_ts=record.get("last_ts"),
-                last_bucket=int(record.get("last_bucket", -1)),
-                now_ts=time.time(),
-                cooldown_minutes=self.session_cooldown,
-                bucket_pct=self.session_bucket_pct,
-            )
-            if not force and not decision.alert:
-                log.info(
-                    "盘中监控：%s 时段[%s] 波动 %.2f%%，%s -> 跳过",
-                    inst_id, window_label, biggest, decision.reason,
-                )
-                continue
-
-            body = self._build_session_alert(symbol, ticker, hits, window_label, levels_dict)
-            body.inst_id = inst_id
-            body.ts_ms = ticker.ts_ms
-            fp = f"session|{inst_id}|{window_label}|b{decision.bucket}"
-            log.info(
-                "盘中监控：%s 时段[%s] 触发告警（%s），最大幅度 %.2f%%，档位 %s",
-                inst_id, window_label, decision.reason, biggest, decision.bucket,
-            )
-            if self.push(body.title(), body.render(), fp, force=True, alert=body):
-                self.state.set_session(state_key, {
-                    "last_ts": time.time(),
-                    "last_bucket": max(decision.bucket, int(record.get("last_bucket", -1))),
-                    "last_pct": round(biggest, 2),
-                    "last_at": now_utc8_str(),
-                    "window": window_label,
-                    "window_start_ts": window_start_ts,
-                })
-                self.state.save()
-                messages.append(body.render())
-        return messages
-
-    def _build_session_alert(self, symbol: dict, ticker, hits: list[dict],
-                             window_label: str, levels_dict: dict | None) -> Alert:
-        inst_id = symbol["inst_id"]
-        name = symbol.get("name", inst_id)
-        # 「发生了什么」只放最大那一条，保证一眼看懂；其余明细放到后面
-        biggest = max(hits, key=lambda h: abs(h["change_pct"]))
-        what = f"{biggest['direction']} {abs(biggest['change_pct']):.2f}%　" \
-               f"（{biggest['text']}）"
-        trigger = "；".join(h["text"] for h in hits)
-
-        extra_lines = [
-            f"【重点时段】{window_label}",
-            f"【盘中K线】{self.session_bar} 周期，来源 OKX /api/v5/market/candles",
-            f"【关键位来源】由真实周K算法推导（近 {symbol.get('levels', {}).get('lookback_weeks', 12)} 周高低点）",
-        ]
-        if len(hits) > 1:
-            extra_lines.append("【全部触发条件】" + trigger)
-        pnl = compute_position_pnl(symbol.get("position") or {}, ticker.last)
-        if pnl:
-            extra_lines.append(render_position_line(pnl))
-
-        facts: dict[str, Any] = {
-            "品种": name,
-            "品种代码": inst_id,
-            "信号类型": "盘中波动",
-            "重点时段": window_label,
-            "实时最新价": ticker.last,
-            "最新价UTC时间": ticker.fetched_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            "触发条件": trigger,
-            "波动明细": [
-                {
-                    "类型": h["kind"],
-                    "区间分钟": h.get("minutes"),
-                    "涨跌幅%": round(h["change_pct"], 2),
-                    "起点价": h["ref_price"],
-                    "起点时间北京": h["ref_time"],
-                    "现价": h["last_price"],
-                    "阈值%": h.get("threshold"),
-                }
-                for h in hits
-            ],
-            "支撑位": (levels_dict or {}).get("nearest_support"),
-            "压力位": (levels_dict or {}).get("nearest_resistance"),
-        }
-        if pnl:
-            facts["你的持仓"] = {
-                "方向": "多单" if pnl.side == "long" else "空单",
-                "开仓价": pnl.entry_price,
-                "杠杆": pnl.leverage,
-                "浮动盈亏U": round(pnl.unrealized, 4),
-                "保证金收益率%": round(pnl.roe_pct, 2),
-            }
-
-        fallback = render_session_fallback(name, window_label, hits, levels_dict)
-        ai_text, source = self.llm.translate(
-            SYSTEM_PROMPT, build_session_user_message(facts), facts, fallback
-        )
-        if source != "deepseek":
-            ai_text = f"{fallback}（说明：本条解读由本地规则模板生成）"
-        safe_text, _ = self.safety.sanitize_ai_text(ai_text, fallback)
-
-        return Alert(
-            symbol=f"{name}（{inst_id}）",
-            short_name=short_symbol(inst_id, name),
-            title_hint=f"盘中{biggest['direction']} {abs(biggest['change_pct']):.2f}%",
-            what_happened=what,
-            time_text=(
-                f"{ticker.fetched_at_utc.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间"
-                f" / {ticker.fetched_at_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                f"（来源 OKX ticker）"
-            ),
-            price=ticker.last,
-            support=(levels_dict or {}).get("nearest_support"),
-            resistance=(levels_dict or {}).get("nearest_resistance"),
-            action_text=(
-                f"{self.safety.enforce_action('')} —— "
-                + zone_hint(ticker.last,
-                            (levels_dict or {}).get("nearest_support"),
-                            (levels_dict or {}).get("nearest_resistance"))
-            ),
-            ai_text=safe_text,
-            signal_type="盘中波动",
-            extra_lines=extra_lines,
-            disclaimer=self.safety.disclaimer,
-        )
+    # 重点时段盘中波动轨（run_session_watch / _build_session_alert）由 src/strategy/tracks/session.py 的 SessionTrack mixin 提供。
 
     # ================= 做空观察位 =================
-    def run_short_watch(self, force: bool = False, ignore_window: bool = False,
-                        now_bj: datetime | None = None) -> list[str]:
-        """重点时段内观察「做空观察位」：日内压力位 + 盘口卖压 → 合成一条判断。
+    # 方向备忘（_note_direction / _cross_track_note）由 src/strategy/memo.py 的
+    # DirectionMemo mixin 提供（Monitor 已继承）。
 
-        只产出「观察区 / 失效位」这类客观描述；不下单、不给开仓或止损指令。
-        force         = 绕过冷却（成交额达标即推）
-        ignore_window = 无视时段限制（手动测试用）
-        """
-        if not self.short_enabled and not (force or ignore_window):
-            return []
-
-        now_bj = now_bj or datetime.now(BEIJING)
-        window = active_window(self.short_windows, now_bj)
-        if window is None and not ignore_window:
-            return []
-        window_label = window.label() if window else "手动触发（不在配置时段内）"
-
-        symbols = self.cfg.enabled_symbols()
-        if self.short_symbols:
-            symbols = [s for s in symbols if s["inst_id"] in self.short_symbols]
-
-        messages: list[str] = []
-        ib_thr = self.short_params["imbalance_threshold"]
-        for symbol in symbols:
-            inst_id = symbol["inst_id"]
-            try:
-                ticker = self.okx.get_ticker(inst_id)
-                candles = self.okx.get_candles(inst_id, self.short_bar, self.short_limit)
-                book = self.okx.get_orderbook(inst_id, self.short_book_depth)
-                trades = self.okx.get_trades(inst_id, self.short_trades_limit)
-            except Exception as exc:
-                log.error("做空观察：%s 盘口/行情获取失败（本轮跳过）：%s", inst_id, exc)
-                continue
-            if not candles:
-                continue
-
-            intraday = derive_intraday_levels(
-                inst_id, candles, ticker.last, bar_minutes=bar_minutes(self.short_bar)
-            )
-            resistance = intraday.nearest_resistance(max_pct=self.short_resistance_max_pct)
-            metrics = compute_orderflow_metrics(
-                book, trades, ticker.last, resistance,
-                top_levels=self.short_top_levels, now_ms=ticker.ts_ms,
-            )
-
-            # 卖压连续性：与上一轮采样对照（无论是否告警都记下本轮，供下轮判连续）
-            pkey = f"short|{inst_id}"
-            prev = self.state.get_session(pkey) or {}
-            prev_ib = prev.get("imbalance")
-            pressure_persist = (
-                isinstance(prev_ib, (int, float))
-                and metrics.imbalance is not None
-                and float(prev_ib) <= ib_thr
-                and metrics.imbalance <= ib_thr
-            )
-            self.state.set_session(pkey, {"imbalance": metrics.imbalance, "at": now_utc8_str()})
-            self.state.save()
-
-            weekly_state = (self.state.get_trend_state(inst_id) or {}).get("state")
-            decision = score_short_signal(
-                current_price=ticker.last,
-                resistance=resistance,
-                recent_high=intraday.day_high,
-                orderflow=metrics,
-                weekly_state=weekly_state,
-                pressure_persist=pressure_persist,
-                **self.short_params,
-            )
-
-            if not decision.alert:
-                # --force 只绕过阈值入流程用于演示；数据不足则绝不强推
-                if not (force and decision.data_ok):
-                    log.info("做空观察：%s 未达阈值（score=%s，%s）", inst_id, decision.score,
-                             "；".join(decision.reasons) or "数据不足")
-                    continue
-                log.info("做空观察：%s 未达阈值，按 --force 强制进入推送流程", inst_id)
-            if decision.observation_level is None:
-                log.warning("做空观察：%s 缺少日内压力位，无法给出观察位，跳过", inst_id)
-                continue
-
-            fp = f"short|{inst_id}|{decision.observation_level:.4g}"
-            try:
-                body = self._build_short_alert(symbol, ticker, intraday, metrics, decision,
-                                               window_label, weekly_state)
-                body.inst_id = inst_id
-                body.ts_ms = ticker.ts_ms
-                status = self.push_status(body.title(), body.render(), fp, force=force,
-                                          cooldown_minutes=self.short_cooldown, alert=body)
-            except Exception:
-                log.error("%s 做空观察告警生成/推送异常：\n%s", inst_id, traceback.format_exc())
-                status = PUSH_FAILED
-            if not self._delivery_settled(f"retry|{fp}", status, force):
-                continue
-            if status == PUSH_SENT:
-                messages.append(body.render())
-        return messages
-
-    @staticmethod
-    def _short_fallback_text(name: str, intraday, metrics, decision, window_label: str) -> str:
-        bits: list[str] = []
-        if decision.rejected:
-            bits.append(f"价格先触及压力位 {fmt_num(decision.observation_level)} 后回落，上冲被拒绝")
-        else:
-            bits.append(f"价格贴近压力位 {fmt_num(decision.observation_level)}")
-        if metrics.imbalance is not None and metrics.imbalance < 0:
-            bits.append(f"盘口买卖量失衡 {metrics.imbalance:+.2f}（负=卖压偏强）")
-        if metrics.taker_sell_ratio is not None:
-            bits.append(f"近端主动卖出占比 {metrics.taker_sell_ratio * 100:.0f}%")
-        if metrics.sell_wall_price is not None and metrics.sell_wall_ratio is not None:
-            bits.append(f"压力位附近挂单放大 {metrics.sell_wall_ratio:.1f} 倍")
-        if "周线多头" in "；".join(decision.reasons):
-            bits.append("周线仍处多头，本次属于逆势观察，风险更高")
-        return (
-            f"{name}：" + "；".join(bits) + "。"
-            f"这只是观察条件：价格站上失效位 {fmt_num(decision.invalidation_level)} 则本次观察不再成立。"
-            "方向与买卖仍由你自行判断，本系统只做提醒。"
-        )
-
-    def _build_short_alert(self, symbol: dict, ticker, intraday, metrics,
-                           decision, window_label: str, weekly_state: str | None) -> Alert:
-        inst_id = symbol["inst_id"]
-        name = symbol.get("name", inst_id)
-        zone = decision.observation_level
-        distance = decision.distance_pct
-        inv_dist = decision.invalidation_distance_pct
-        imbalance_text = f"{metrics.imbalance:+.2f}" if metrics.imbalance is not None else "未提供"
-        sell_text = (
-            f"{metrics.taker_sell_ratio * 100:.0f}%"
-            if metrics.taker_sell_ratio is not None else "未提供"
-        )
-
-        extra_lines = [
-            f"【重点时段】{window_label}",
-            f"【观察区】{fmt_num(zone)}（现价上方 {distance:+.2f}%）" if distance is not None
-            else f"【观察区】{fmt_num(zone)}",
-            f"【失效位】{fmt_num(decision.invalidation_level)}"
-            + (f"（若价格站上该位，本次观察条件不再成立，距现价 {inv_dist:+.2f}%）"
-               if inv_dist is not None else "（若价格站上该位，本次观察条件不再成立）"),
-            f"【盘口】买卖失衡 {imbalance_text}（负=卖压）｜主动卖出占比 {sell_text}"
-            f"｜逐笔样本 {metrics.trade_count} 笔",
-            f"【日内关键位】前日高 {fmt_num(intraday.prev_day_high)}｜当日高 "
-            f"{fmt_num(intraday.day_high)}｜VWAP {fmt_num(intraday.vwap)}",
-            f"【数据来源】OKX /market/books 盘口 + /market/trades 逐笔 + {self.short_bar} K线",
-        ]
-        if metrics.sell_wall_price is not None and metrics.sell_wall_ratio is not None:
-            extra_lines.append(
-                f"【压力位附近卖墙】{fmt_num(metrics.sell_wall_price)}"
-                f"（挂单量为同侧中位的 {metrics.sell_wall_ratio:.1f} 倍）"
-            )
-        weekly_label = STATE_SHORT.get(weekly_state, weekly_state) if weekly_state else "未记录"
-        if weekly_state == "bull":
-            extra_lines.append("【周线对照】周线多头，本次为逆势观察（打分已扣分）")
-        else:
-            extra_lines.append(f"【周线对照】周线状态 {weekly_label}")
-        pnl = compute_position_pnl(symbol.get("position") or {}, ticker.last)
-        if pnl:
-            extra_lines.append(render_position_line(pnl))
-
-        facts: dict[str, Any] = {
-            "品种": name,
-            "品种代码": inst_id,
-            "信号类型": SIGNAL_SHORT,
-            "重点时段": window_label,
-            "实时最新价": ticker.last,
-            "最新价UTC时间": ticker.fetched_at_utc.strftime("%Y-%m-%d %H:%M:%S"),
-            "日内观察区(压力位)": zone,
-            "观察区距现价%": round(distance, 2) if distance is not None else None,
-            "失效位": decision.invalidation_level,
-            "失效位距现价%": round(inv_dist, 2) if inv_dist is not None else None,
-            "前日高点": intraday.prev_day_high,
-            "当日高点": intraday.day_high,
-            "当日低点": intraday.day_low,
-            "当日VWAP": intraday.vwap,
-            "盘口买卖失衡": metrics.imbalance,
-            "主动卖出占比%": (
-                round(metrics.taker_sell_ratio * 100, 1)
-                if metrics.taker_sell_ratio is not None else None
-            ),
-            "压力位附近卖墙": metrics.sell_wall_price,
-            "卖墙倍数": round(metrics.sell_wall_ratio, 2) if metrics.sell_wall_ratio is not None else None,
-            "逐笔样本数": metrics.trade_count,
-            "盘口档位数": metrics.depth_levels,
-            "周线状态": weekly_label,
-            "触发理由": decision.reasons,
-            "打分": decision.score,
-        }
-        if pnl:
-            facts["你的持仓"] = {
-                "方向": "多单" if pnl.side == "long" else "空单",
-                "开仓价": pnl.entry_price,
-                "杠杆": pnl.leverage,
-                "浮动盈亏U": round(pnl.unrealized, 4),
-                "保证金收益率%": round(pnl.roe_pct, 2),
-            }
-
-        fallback = self._short_fallback_text(name, intraday, metrics, decision, window_label)
-        ai_text, source = self.llm.translate(
-            SYSTEM_PROMPT, build_short_user_message(facts), facts, fallback
-        )
-        if source != "deepseek":
-            ai_text = f"{fallback}（说明：本条解读由本地规则模板生成）"
-        safe_text, _ = self.safety.sanitize_ai_text(ai_text, fallback)
-
-        rejection = "，触及压力位后回落（上冲被拒绝）" if decision.rejected else "，贴近压力位"
-        happened = f"价格逼近日内压力位 {fmt_num(zone)}{rejection}，盘口呈现卖压（观察位，非入场指令）"
-        action = (
-            f"{self.safety.enforce_action('')} —— "
-            f"到观察区先看能否被压回；若价格站上失效位 {fmt_num(decision.invalidation_level)}，"
-            "本次观察条件作废"
-        )
-        return Alert(
-            symbol=f"{name}（{inst_id}）",
-            short_name=short_symbol(inst_id, name),
-            title_hint=SIGNAL_SHORT,
-            what_happened=happened,
-            time_text=(
-                f"{ticker.fetched_at_utc.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间"
-                f" / {ticker.fetched_at_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC"
-                f"（来源 OKX ticker + 盘口）"
-            ),
-            price=ticker.last,
-            support=None,
-            resistance=zone,
-            action_text=action,
-            ai_text=safe_text,
-            signal_type=SIGNAL_SHORT,
-            extra_lines=extra_lines,
-            disclaimer=self.safety.disclaimer,
-        )
+    # 做空观察位轨（ANCHOR_STALE_HOURS / _anchor_key / _open_short_anchor / _fake_break_followup / run_short_watch / _short_fallback_text / _build_short_alert）由 src/strategy/tracks/short.py 的 ShortTrack mixin 提供。
 
     # ================= 自检 =================
     def check(self) -> bool:
@@ -1384,7 +677,7 @@ class Monitor:
             print("    注：没有 key 系统仍可运行，解读会退回本地规则模板（数字依然真实）")
 
         print("\n[3] 行情数据源（OKX 只读接口 + 可选美股本土历史）")
-        for symbol in self.cfg.enabled_symbols():
+        for symbol in self._active_symbols():
             inst_id = symbol["inst_id"]
             try:
                 inst = self.okx.get_instrument(inst_id, symbol.get("inst_type", "SWAP"))
@@ -1479,7 +772,7 @@ def replay_session(monitor: Monitor, hours: float) -> int:
     print("=" * 78)
 
     total = 0
-    for symbol in monitor.cfg.enabled_symbols():
+    for symbol in monitor._active_symbols():
         inst_id = symbol["inst_id"]
         try:
             candles = monitor.okx.get_candles(inst_id, bar, limit)
@@ -1564,6 +857,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--event-only", action="store_true")
     parser.add_argument("--session-only", action="store_true", help="只跑重点时段盘中监控")
     parser.add_argument("--short-only", action="store_true", help="只跑做空观察位监控")
+    parser.add_argument("--world-only", action="store_true",
+                        help="只跑国际大事轨（忽略轮询间隔与冷却，调试用）")
     parser.add_argument("--ignore-window", action="store_true",
                         help="无视时段限制，立即做一次盘中波动检查（测试用）")
     parser.add_argument("--session-replay", type=float, default=None,
@@ -1629,16 +924,34 @@ def main(argv: list[str] | None = None) -> int:
                 monitor.cfg.resolve_path(str(monitor.app.get("log_dir", "logs"))),
                 str(monitor.app.get("log_level", "INFO")),
             )
-            if not (args.event_only or args.session_only or args.short_only):
+            # 重读本地控制台改动（品种开关 / 免打扰 / 重点提醒 / 持仓）
+            monitor.reload_control()
+            # 已退出免打扰：先把延迟队列里的消息补发掉，再跑本轮轨道
+            if not monitor.control.is_dnd_active(datetime.now(BEIJING)):
+                flushed = monitor._flush_pending()
+                if flushed:
+                    log.info("免打扰已结束，补发延迟消息 %d 条", flushed)
+            if not (args.event_only or args.session_only or args.short_only
+                    or args.world_only):
                 monitor.run_trend(force=args.force, only=args.symbol)
-            if not (args.trend_only or args.session_only or args.short_only):
+            if not (args.trend_only or args.session_only or args.short_only
+                    or args.world_only):
                 monitor.run_events(force=args.force,
                                    pre_minutes_override=args.pre_window_minutes,
                                    max_events_override=args.max_events)
-            if not (args.trend_only or args.event_only or args.short_only):
+            if not (args.trend_only or args.event_only or args.short_only
+                    or args.world_only):
                 monitor.run_session_watch(force=args.force, ignore_window=args.ignore_window)
-            if not (args.trend_only or args.event_only or args.session_only):
+            if not (args.trend_only or args.event_only or args.session_only
+                    or args.world_only):
                 monitor.run_short_watch(force=args.force, ignore_window=args.ignore_window)
+            if not (args.trend_only or args.event_only or args.session_only
+                    or args.short_only):
+                pushed = monitor.run_world_events(
+                    force=args.force or args.world_only)
+                if pushed:
+                    log.info("国际大事本轮推送 %d 条：%s",
+                             len(pushed), "；".join(pushed))
         except Exception:
             log.error("本轮执行出现异常（程序继续存活）：\n%s", traceback.format_exc())
 

@@ -18,12 +18,15 @@ const state = {
   typeFilter: '',
   selectedIndex: null,
   chart: null,
+  view: 'market',
+  control: null,
 };
 
 const TYPE_CLASS = {
   '趋势': 'trend',
   '事件预警': 'event',
   '事件结果': 'event',
+  '国际大事': 'world',
   '做空观察位': 'short',
   '盘中波动': 'session',
 };
@@ -31,6 +34,7 @@ const TYPE_COLOR = {
   '趋势': '#3b82f6',
   '事件预警': '#f59e0b',
   '事件结果': '#f59e0b',
+  '国际大事': '#22d3ee',
   '做空观察位': '#f6465d',
   '盘中波动': '#a855f7',
 };
@@ -90,6 +94,29 @@ async function fetchJson(url) {
   return payload;
 }
 
+// 控制页的写接口：唯一允许写的地方，只改运行期偏好（不是交易接口）
+async function postJson(url, payload) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  let data = null;
+  try { data = await res.json(); } catch (err) { data = null; }
+  if (!res.ok) {
+    const detail = data && data.error ? data.error : `HTTP ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+// 把后端来的值安全地放进 HTML（备注里可能有引号之类）
+function esc(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // 告警时间落在哪一根 K 线上：最后一个「起始时间 <= 告警时间」的下标
 function barIndexFor(times, ts) {
   if (!Array.isArray(times) || times.length === 0 || ts === null || ts === undefined) return -1;
@@ -137,6 +164,12 @@ async function init() {
     scheduleRefresh();
   });
 
+  // 顶部标签：行情 / 控制
+  el('tabs').addEventListener('click', (event) => {
+    const tab = event.target.closest('button[data-view]');
+    if (tab) switchView(tab.dataset.view);
+  });
+
   window.addEventListener('resize', () => state.chart && state.chart.resize());
 
   // 首次进入页面就取一次数（否则要等下一次自动刷新或手动点「立即刷新」才有内容）
@@ -148,18 +181,50 @@ async function init() {
 function scheduleRefresh() {
   if (state.timer) { clearInterval(state.timer); state.timer = null; }
   if (!state.autoRefresh) return;
-  state.timer = setInterval(() => { if (state.instId) loadAll(true); }, state.refreshSeconds * 1000);
+  // 只在行情页轮询；控制页不需要反复打行情接口
+  state.timer = setInterval(() => {
+    if (state.instId && state.view === 'market') loadAll(true);
+  }, state.refreshSeconds * 1000);
+}
+
+function switchView(view) {
+  state.view = view === 'control' ? 'control' : 'market';
+  [...el('tabs').children].forEach((b) => b.classList.toggle('active', b.dataset.view === state.view));
+  el('view-market').classList.toggle('hidden', state.view !== 'market');
+  el('view-control').classList.toggle('hidden', state.view !== 'control');
+  el('market-controls').classList.toggle('hidden', state.view !== 'market');
+  if (state.view === 'control') {
+    loadControl().catch((err) => showError(`加载控制项失败：${err.message}`));
+  } else if (state.chart) {
+    state.chart.resize();
+  }
+}
+
+function renderSymbolOptions() {
+  el('symbol-select').innerHTML = state.symbols.map((s) =>
+    `<option value="${s.inst_id}"${s.enabled ? '' : ' data-off="1"'}>` +
+    `${s.enabled ? '●' : '○'} ${s.short_name}　${s.name}${s.enabled ? '' : '（已停用）'}</option>`
+  ).join('');
 }
 
 async function loadSymbols() {
   const payload = await fetchJson('/api/symbols');
   state.symbols = payload.symbols || [];
-  el('symbol-select').innerHTML = state.symbols.map((s) =>
-    `<option value="${s.inst_id}"${s.enabled ? '' : ' data-off="1"'}>` +
-    `${s.enabled ? '●' : '○'} ${s.short_name}　${s.name}${s.enabled ? '' : '（已停用）'}</option>`
-  ).join('');
+  renderSymbolOptions();
   const first = state.symbols.find((s) => s.enabled) || state.symbols[0];
   state.instId = first ? first.inst_id : null;
+  if (state.instId) el('symbol-select').value = state.instId;
+}
+
+async function syncSymbolOptions() {
+  // 控制页改过开关后同步行情页下拉，尽量保留当前选中的品种
+  const payload = await fetchJson('/api/symbols');
+  state.symbols = payload.symbols || [];
+  renderSymbolOptions();
+  if (!state.instId || !state.symbols.some((s) => s.inst_id === state.instId)) {
+    const first = state.symbols.find((s) => s.enabled) || state.symbols[0];
+    state.instId = first ? first.inst_id : null;
+  }
   if (state.instId) el('symbol-select').value = state.instId;
 }
 
@@ -476,7 +541,9 @@ function renderAlerts() {
         <span>现价 ${fmtNum(alert.price)}</span>
         ${levels ? `<span>${levels}</span>` : ''}
         ${onChart ? '' : '<span class="alert-off">不在当前K线范围内</span>'}
+        <span class="muted">点开看详情</span>
       </div>
+      ${alertDetailHtml(alert)}
     </li>`;
   }).join('');
 
@@ -484,10 +551,22 @@ function renderAlerts() {
     item.addEventListener('click', () => {
       const ts = item.dataset.ts ? Number(item.dataset.ts) : null;
       const idx = barIndexFor(times, ts);
-      list.querySelectorAll('.alert-item').forEach((other) => other.classList.remove('selected'));
+      const wasSelected = item.classList.contains('selected');
+      // 先全部收起，再决定要不要展开当前这条（点第二次 = 收起）
+      list.querySelectorAll('.alert-item').forEach((other) => {
+        other.classList.remove('selected');
+        const detail = other.querySelector('.alert-detail');
+        if (detail) detail.classList.add('hidden');
+      });
+      if (wasSelected) { state.selectedIndex = null; showError(''); return; }
+
       item.classList.add('selected');
+      const detail = item.querySelector('.alert-detail');
+      if (detail) detail.classList.remove('hidden');
+
       if (idx < 0 || idx >= times.length) {
-        showError('这条消息的时间不在当前 K 线范围内，换个更长的周期或往前拖动即可对齐。');
+        state.selectedIndex = null;
+        showError('详情已展开。这条消息不在当前 K 线范围内，换个更长的周期或往前拖动即可对齐到图上。');
         return;
       }
       showError('');
@@ -497,6 +576,237 @@ function renderAlerts() {
   });
 }
 
+// 单条消息的详情块（默认收起，点开才显示）。
+// 全部字段都来自后端落盘的真实记录；没保存到的一律留空，不编造。
+function alertDetailHtml(alert) {
+  const rows = [
+    ['类型', alert.signal_type || '未记录'],
+    ['品种', alert.symbol || alert.inst_id || '未记录'],
+    ['推送时间', alert.pushed_at || '未记录'],
+    ['数据时间', alert.ts_text || '未记录'],
+    ['参考价位', [
+      `现价 ${fmtNum(alert.price)}`,
+      alert.support !== null && alert.support !== undefined ? `支撑 ${fmtNum(alert.support)}` : '',
+      alert.resistance !== null && alert.resistance !== undefined ? `压力 ${fmtNum(alert.resistance)}` : '',
+    ].filter(Boolean).join('　')],
+    ['数据来源', `${alert.source_label || '实时'}${alert.source === 'log_backfill' ? '（旧消息，从日志回填）' : ''}`],
+  ];
+  return `<div class="alert-detail hidden">
+    <div class="alert-detail-title">${esc(alert.title || '(无标题)')}</div>
+    ${rows.map(([k, v]) => `<div class="ad-row"><span class="k">${k}</span><span class="v">${esc(v)}</span></div>`).join('')}
+    ${alert.what_happened ? `<div class="ad-happened">${esc(alert.what_happened)}</div>` : ''}
+    ${alert.body
+      ? `<div class="ad-label muted">推送原文</div><div class="ad-body">${esc(alert.body)}</div>`
+      : '<p class="ad-note muted">这条是更早的记录，落盘时还没保存推送全文，只留了上面的结构化摘要。</p>'}
+  </div>`;
+}
+
+// ---------------------------------------------------------------- 控制页
+const TRACK_SHORT = {
+  trend: '趋势', event: '事件', world: '国际大事',
+  short: '做空观察', session: '盘中波动',
+};
+const WEEKDAY_NAMES = ['一', '二', '三', '四', '五', '六', '日'];
+
+function weekdaysText(days) {
+  if (!Array.isArray(days) || !days.length) return '每天';
+  return '周' + days.map((d) => WEEKDAY_NAMES[d] || '').join('');
+}
+
+async function loadControl() {
+  const data = await fetchJson('/api/control');
+  state.control = data;
+  renderControl(data);
+}
+
+function applyControl(control) {
+  // 写接口都会回传最新快照，直接用返回值刷新，免得再打一次接口
+  state.control = control;
+  renderControl(control);
+  syncSymbolOptions().then(() => {
+    if (state.view === 'market' && state.instId) loadAll(true);
+  }).catch(() => {});
+}
+
+function renderControl(data) {
+  el('control-updated').textContent = data.updated_at ? `配置更新于 ${data.updated_at}` : '';
+
+  // ---- 品种开关 ----
+  const symbols = data.symbols || [];
+  el('control-symbols').innerHTML = symbols.map((s) => `
+    <li class="control-symbol">
+      <label class="switch">
+        <input type="checkbox" data-inst="${esc(s.inst_id)}" ${s.enabled ? 'checked' : ''}>
+        <span class="slider"></span>
+      </label>
+      <div class="cs-main">
+        <div class="cs-name">${esc(s.short_name)}　<span class="muted">${esc(s.name)}</span>
+          ${s.priority ? '<span class="pill-priority">重点</span>' : ''}</div>
+        <div class="muted small">${
+          s.override === null
+            ? `跟随配置（原为${s.config_enabled ? '启用' : '停用'}）`
+            : (s.enabled ? '已手动开启' : '已手动关闭')
+        }</div>
+      </div>
+    </li>`).join('');
+
+  el('control-symbols').querySelectorAll('input[data-inst]').forEach((input) => {
+    input.addEventListener('change', () => {
+      saveSymbol(input.dataset.inst, input.checked)
+        .catch((err) => { showError(`保存品种开关失败：${err.message}`); input.checked = !input.checked; });
+    });
+  });
+
+  // ---- 免打扰 ----
+  const dnd = data.dnd || { enabled: false, windows: [] };
+  el('dnd-toggle').checked = !!dnd.enabled;
+  el('dnd-windows').innerHTML = (dnd.windows || []).length
+    ? dnd.windows.map((w, i) => `
+      <div class="dnd-window">
+        <span class="dw-name">${esc(w.name || '免打扰')}</span>
+        <span class="muted">${esc(w.start)} – ${esc(w.end)}</span>
+        <span class="muted small">${weekdaysText(w.weekdays)}</span>
+        <button class="btn-mini" data-rm="${i}">删除</button>
+      </div>`).join('')
+    : '<p class="muted small">还没有时段，开启免打扰前请先加一条。</p>';
+  el('dnd-windows').querySelectorAll('button[data-rm]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const windows = (dnd.windows || []).filter((_, i) => i !== Number(btn.dataset.rm));
+      saveDnd(!!dnd.enabled, windows).catch((err) => showError(`删除时段失败：${err.message}`));
+    });
+  });
+  el('dnd-status').textContent = dnd.enabled
+    ? (dnd.active_now ? '当前正处于免打扰时段：非重点消息会延迟补发。' : '免打扰已开启，当前不在任何时段内。')
+    : '免打扰已关闭。';
+
+  // ---- 重点提醒 ----
+  const pri = data.priority || { symbols: [], tracks: [] };
+  el('priority-symbols').innerHTML = symbols.map((s) => `
+    <button class="chip ${pri.symbols.includes(s.inst_id) ? 'on' : ''}"
+      data-pinst="${esc(s.inst_id)}">${esc(s.short_name)}</button>`).join('');
+  el('priority-symbols').querySelectorAll('button[data-pinst]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const inst = btn.dataset.pinst;
+      const next = pri.symbols.includes(inst)
+        ? pri.symbols.filter((x) => x !== inst)
+        : pri.symbols.concat([inst]);
+      savePriority(next, pri.tracks).catch((err) => showError(`保存重点品种失败：${err.message}`));
+    });
+  });
+  el('priority-tracks').innerHTML = (data.tracks || []).map((t) => `
+    <button class="chip ${pri.tracks.includes(t.key) ? 'on' : ''}"
+      data-ptrack="${esc(t.key)}" title="${esc(t.label)}">${esc(TRACK_SHORT[t.key] || t.key)}</button>`).join('');
+  el('priority-tracks').querySelectorAll('button[data-ptrack]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.ptrack;
+      const next = pri.tracks.includes(key)
+        ? pri.tracks.filter((x) => x !== key)
+        : pri.tracks.concat([key]);
+      savePriority(pri.symbols, next).catch((err) => showError(`保存重点轨道失败：${err.message}`));
+    });
+  });
+
+  // ---- 持仓 ----
+  el('position-forms').innerHTML = symbols.map((s) => {
+    const p = s.position || {};
+    const source = s.position_source === 'override' ? '控制台填写'
+      : (s.position_source === 'config' ? '来自 config' : '未设置');
+    return `<div class="pos-form" data-inst="${esc(s.inst_id)}">
+      <div class="pos-head">
+        <span class="cs-name">${esc(s.short_name)}</span>
+        <span class="muted small">${source}</span>
+      </div>
+      <div class="pos-grid">
+        <label>方向
+          <select data-f="side">
+            <option value=""${!p.side ? ' selected' : ''}>—</option>
+            <option value="long"${p.side === 'long' ? ' selected' : ''}>多</option>
+            <option value="short"${p.side === 'short' ? ' selected' : ''}>空</option>
+          </select>
+        </label>
+        <label>开仓价<input type="number" step="any" data-f="entry_price" value="${esc(p.entry_price)}"></label>
+        <label>保证金<input type="number" step="any" data-f="margin_usdt" value="${esc(p.margin_usdt)}"></label>
+        <label>杠杆<input type="number" step="any" data-f="leverage" value="${esc(p.leverage)}"></label>
+        <label class="pos-note">备注<input type="text" data-f="note" value="${esc(p.note)}"></label>
+      </div>
+      <div class="pos-actions">
+        <button class="btn-mini primary" data-save="${esc(s.inst_id)}">保存</button>
+        <button class="btn-mini" data-clear="${esc(s.inst_id)}">清除覆盖</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  el('position-forms').querySelectorAll('.pos-form').forEach((form) => {
+    const inst = form.dataset.inst;
+    form.querySelector(`button[data-save="${inst}"]`).addEventListener('click', () => {
+      savePosition(inst, readPositionForm(form))
+        .catch((err) => showError(`保存持仓失败：${err.message}`));
+    });
+    form.querySelector(`button[data-clear="${inst}"]`).addEventListener('click', () => {
+      savePosition(inst, { side: '', entry_price: '', margin_usdt: '', leverage: '', note: '' })
+        .catch((err) => showError(`清除持仓失败：${err.message}`));
+    });
+  });
+}
+
+function readPositionForm(form) {
+  const payload = {};
+  form.querySelectorAll('[data-f]').forEach((input) => { payload[input.dataset.f] = input.value; });
+  return payload;
+}
+
+async function saveSymbol(instId, enabled) {
+  const out = await postJson('/api/control/symbol', { inst_id: instId, enabled: enabled });
+  applyControl(out.control);
+  showError('');
+}
+
+async function saveDnd(enabled, windows) {
+  const out = await postJson('/api/control/dnd', { enabled: enabled, windows: windows });
+  applyControl(out.control);
+  showError('');
+}
+
+async function savePriority(symbols, tracks) {
+  const out = await postJson('/api/control/priority', { symbols: symbols, tracks: tracks });
+  applyControl(out.control);
+  showError('');
+}
+
+async function savePosition(instId, payload) {
+  const out = await postJson('/api/control/position',
+    Object.assign({ inst_id: instId }, payload));
+  applyControl(out.control);
+  showError('');
+}
+
+function wireDndAdd() {
+  el('dnd-add-btn').addEventListener('click', () => {
+    const dnd = (state.control && state.control.dnd) || { enabled: false, windows: [] };
+    const name = el('dnd-name').value.trim() || '免打扰';
+    const weekdays = [...el('dnd-weekdays').querySelectorAll('input:checked')]
+      .map((box) => Number(box.value));
+    const window_ = {
+      name: name,
+      start: el('dnd-start').value || '23:00',
+      end: el('dnd-end').value || '07:00',
+      weekdays: weekdays,
+    };
+    saveDnd(!!dnd.enabled, (dnd.windows || []).concat([window_]))
+      .then(() => { el('dnd-name').value = ''; })
+      .catch((err) => showError(`添加免打扰时段失败：${err.message}`));
+  });
+  el('dnd-toggle').addEventListener('change', () => {
+    const dnd = (state.control && state.control.dnd) || { enabled: false, windows: [] };
+    saveDnd(el('dnd-toggle').checked, dnd.windows || [])
+      .catch((err) => {
+        showError(`保存免打扰开关失败：${err.message}`);
+        el('dnd-toggle').checked = !el('dnd-toggle').checked;
+      });
+  });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  wireDndAdd();
   init().catch((err) => showError(`初始化失败：${err.message}`));
 });

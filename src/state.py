@@ -26,6 +26,9 @@ class StateStore:
             "events": {},
             "session": {},
             "retries": {},
+            # 国际大事：{"seen": {url指纹: {"ts":, "sent_symbols": [...], "evaluated": bool}},
+            #           "pushed": {"YYYY-MM-DD": 当天已推条数}}
+            "world": {},
         }
         self.load()
 
@@ -112,3 +115,70 @@ class StateStore:
 
     def set_session(self, key: str, info: dict[str, Any]) -> None:
         self._data.setdefault("session", {})[key] = info
+
+    # ---------- 国际大事记忆（URL 去重 + 每日上限）----------
+    WORLD_SEEN_KEEP_DAYS = 14
+
+    def _world(self) -> dict[str, Any]:
+        world = self._data.setdefault("world", {})
+        if not isinstance(world, dict):
+            world = {}
+            self._data["world"] = world
+        world.setdefault("seen", {})
+        world.setdefault("pushed", {})
+        return world
+
+    def _prune_world_seen(self) -> None:
+        cutoff = time.time() - self.WORLD_SEEN_KEEP_DAYS * 86400
+        seen = self._world()["seen"]
+        stale = [k for k, v in seen.items()
+                 if not isinstance(v, dict) or float(v.get("ts", 0)) < cutoff]
+        for k in stale:
+            seen.pop(k, None)
+
+    def get_world(self, url_key: str) -> dict[str, Any] | None:
+        value = self._world()["seen"].get(url_key)
+        return value if isinstance(value, dict) else None
+
+    def world_symbol_done(self, url_key: str, inst_id: str) -> bool:
+        rec = self.get_world(url_key)
+        return bool(rec and inst_id in (rec.get("sent_symbols") or []))
+
+    def is_world_evaluated(self, url_key: str) -> bool:
+        rec = self.get_world(url_key)
+        return bool(rec and rec.get("evaluated"))
+
+    def mark_world_evaluated(self, url_key: str) -> None:
+        """该新闻已研判过但不推（非大事/方向中性），此后不再重复研判。"""
+        seen = self._world()["seen"]
+        rec = seen.get(url_key) if isinstance(seen.get(url_key), dict) else {}
+        rec["ts"] = time.time()
+        rec["evaluated"] = True
+        seen[url_key] = rec
+        self._prune_world_seen()
+
+    def mark_world_symbol_sent(self, url_key: str, inst_id: str) -> None:
+        seen = self._world()["seen"]
+        rec = seen.get(url_key) if isinstance(seen.get(url_key), dict) else {}
+        symbols = rec.setdefault("sent_symbols", [])
+        if inst_id not in symbols:
+            symbols.append(inst_id)
+        rec["ts"] = time.time()
+        seen[url_key] = rec
+        self._prune_world_seen()
+
+    def world_pushed_today(self, today: str) -> int:
+        value = self._world()["pushed"].get(today, 0)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 0
+
+    def bump_world_pushed(self, today: str) -> int:
+        pushed = self._world()["pushed"]
+        # 只保留今天的计数
+        for stale_day in [d for d in pushed if d != today]:
+            pushed.pop(stale_day, None)
+        count = self.world_pushed_today(today) + 1
+        pushed[today] = count
+        return count

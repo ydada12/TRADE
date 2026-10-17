@@ -1,15 +1,20 @@
-"""启动本地只读可视化面板。
+"""启动本地可视化面板（行情页只读 + 本地控制页）。
 
 用法：
   python tools/dashboard.py                 # 起服务并自动打开浏览器
   python tools/dashboard.py --no-browser    # 只起服务
   python tools/dashboard.py --port 8888 --refresh 30
 
-它做四件事（全部只读，不接交易接口、不下单、不发推送）：
+行情页做四件事（只读，不接交易接口、不下单、不发推送）：
   1. 品种下拉：切换 config.yaml 里的任意品种（已停用的灰显但仍可查看）
   2. K 线：现成的行情图，支持 5m / 15m / 1H / 4H / 1D / 1W
   3. 历史消息：推送过的告警列表（来自 state/alerts.jsonl）
   4. 在 K 线上标注每条历史告警发生的时间与价位
+
+控制页（新增，唯一的写入口）只改运行期偏好，落盘 state/control.json：
+  1. 逐品种监控开关   2. 消息免打扰（开关 + 时段，延迟补发）
+  3. 重点提醒（品种 / 轨道，免打扰期间照常推送）  4. 持仓覆盖（用于盈亏提醒）
+  仍然不接交易接口、不下单、不发推送、不调大模型，也绝不回写 config.yaml。
 
 安全问题：默认只监听 127.0.0.1（本机），不对外网暴露；端口被占用时直接报错，
 绝不静默换端口——否则你以为在看 A 面板，实际看的是别的东西。
@@ -36,7 +41,7 @@ try:
 except (AttributeError, ValueError):
     pass
 
-WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+WEB_ROOT = Path(__file__).resolve().parent.parent / "frontend"
 
 
 def _port_available(host: str, port: int) -> bool:
@@ -86,11 +91,12 @@ def main() -> int:
 
     url = f"http://{args.host}:{args.port}/"
     enabled = [s for s in service.symbols() if s["enabled"]]
-    print("本地只读面板已启动（本页面只读展示，不构成任何买卖建议）")
+    print("本地面板已启动（行情页只读；控制页只改本地监控与推送偏好，不接交易、不下单）")
     print(f"  地址：{url}")
     print(f"  品种：{len(service.symbols())} 个（启用 {len(enabled)} 个；已停用的灰显但仍可查看）")
     print(f"  缓存：{args.refresh:g} 秒；K线上限：{args.kline_max} 根")
     print(f"  告警历史：{service.history.path}")
+    print(f"  控制项：{service.control.path}")
     print("  按 Ctrl+C 停止")
 
     if not args.no_browser:

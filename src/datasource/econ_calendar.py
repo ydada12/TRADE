@@ -132,12 +132,17 @@ class EconCalendarClient:
     def __init__(self, days_ahead: int = 7, min_importance: int = 2,
                  keywords: list[str] | None = None,
                  regions: list[str] | None = None,
+                 lookback_days: int = 1,
                  day_retries: int = 2,
                  day_interval_seconds: float = 0.4) -> None:
         self.days_ahead = days_ahead
         self.min_importance = min_importance
         self.keywords = [k for k in (keywords or []) if k]
         self.regions = [r for r in (regions or []) if r]
+        # 要往前回看几天：数据源的「公布」（实际值）列不是公布瞬间就填上的，
+        # 实测常滞后几十分钟到几小时；晚间的美国数据（20:30/22:30 公布）经常要
+        # 等跨过北京时间零点才填上，若只从「今天」开始抓，隔夜的实际值就永远取不到。
+        self.lookback_days = max(0, int(lookback_days))
         # 百度经济日历会限流（实测出现过 HTTP 403），所以按天抓取 + 重试 + 间隔
         self.day_retries = max(1, int(day_retries))
         self.day_interval_seconds = max(0.0, float(day_interval_seconds))
@@ -153,8 +158,8 @@ class EconCalendarClient:
                 "未安装 akshare，无法读取经济日历。请执行：python -m pip install akshare"
             ) from exc
 
-        start = start or datetime.now(BEIJING).date()
-        days = self.days_ahead if days is None else days
+        start = start or (datetime.now(BEIJING).date() - timedelta(days=self.lookback_days))
+        days = (self.days_ahead + self.lookback_days) if days is None else days
         events: list[EconEvent] = []
         failed_days: list[str] = []
 

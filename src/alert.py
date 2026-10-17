@@ -21,6 +21,7 @@ UTC8 = timezone(timedelta(hours=8))
 SIGNAL_TREND = "趋势"
 SIGNAL_EVENT = "事件"
 SIGNAL_SHORT = "做空观察位"
+SIGNAL_WORLD = "国际大事"
 
 
 def fmt_num(value: Any, digits: int | None = None) -> str:
@@ -76,7 +77,8 @@ class Alert:
     support: float | None = None     # 支撑位
     resistance: float | None = None  # 压力位
     action_text: str = ""            # 当下该做什么（只允许固定话术）
-    ai_text: str = ""                # AI 解读
+    ai_text: str = ""                # AI 思考（大模型不可用时为规则模板文案）
+    rule_text: bool = False          # True = 上面这段是本地规则模板生成的，不是大模型写的
     signal_type: str = ""            # 盘中波动 / 趋势 / 事件
     short_name: str = ""             # 标题用的短名，如 TQQQ
     title_hint: str = ""             # 标题用的极短概括，如「趋势多头未变」
@@ -87,6 +89,11 @@ class Alert:
     # ts_ms 是「这条告警当时看到的价格对应的时间」，面板靠它把告警钉到对应的 K 线上。
     inst_id: str = ""
     ts_ms: int | None = None
+
+    # 一眼可辨的「事件句」：不同形态（贴近压力位 / 假突破回落）用不同 emoji 与动词，
+    # 挂在正文最上方，避免两种观察位长得一模一样。
+    kind_label: str = ""             # 覆盖正文标题里的类型名，如「假突破回落观察位」
+    headline: str = ""               # 正文首行事件句，如「⬇️ 冲高回落｜假突破确认」
 
     # ---------- 标题（微信通知栏只显示这一行，必须短且信息量大）----------
     def title(self) -> str:
@@ -107,8 +114,12 @@ class Alert:
              --- 只用于切出「行动」与「风险提示」两段。
         """
         short = self.short_name or self.symbol
-        kind = self.signal_type or "监控提醒"
-        blocks: list[str] = [f"## 【{short}】{kind}", f"**{self.what_happened}**"]
+        kind = self.kind_label or self.signal_type or "监控提醒"
+        blocks: list[str] = [f"## 【{short}】{kind}"]
+        # 事件句在正文最上方：一眼看出这次是「贴近压力位」还是「冲高回落」
+        if self.headline:
+            blocks.append(f"### {self.headline}")
+        blocks.append(f"**{self.what_happened}**")
 
         numbers = [f"🔴 **压力位** {self._level_line(self.resistance, above=True)}",
                    f"🟢 **支撑位** {self._level_line(self.support, above=False)}"]
@@ -122,7 +133,7 @@ class Alert:
         blocks.append(f"**{self.action_text}**")
 
         if self.ai_text:
-            blocks.append("### 🤖 AI 解读")
+            blocks.append("### 📝 规则文案" if self.rule_text else "### 🤖 AI 思考")
             blocks.append(self.ai_text)
 
         if self.extra_lines:
@@ -193,6 +204,11 @@ class EventAlert:
     title_hint: str = ""
     extra_lines: list[str] = field(default_factory=list)
     disclaimer: str = ""
+    # 公布后推送的确定性方向结论：「偏多」/「偏空」+ 一句传导链
+    verdict: str = ""
+    verdict_chain: str = ""
+    # True = 本条是大模型不可用时的确定性兜底文案（标题也随之改口径）
+    rule_text: bool = False
 
     # 面板标注用（与 Alert 同口径）：品种标识 + 数据时间（epoch ms）。
     inst_id: str = ""
@@ -209,6 +225,12 @@ class EventAlert:
         short = self.short_name or self.symbol or "事件"
         blocks: list[str] = [f"## 【{short}】{prefix}", f"**{self.happened}**"]
 
+        # 公布后必须第一眼看到明确方向（由确定性逻辑给出，不依赖大模型）
+        if self.stage == "post" and self.verdict:
+            blocks.append(f"🎯 **方向研判：{self.verdict}**")
+            if self.verdict_chain:
+                blocks.append(self.verdict_chain)
+
         numbers = [f"🔴 **压力位** {_level_line(self.resistance, self.price, above=True)}",
                    f"🟢 **支撑位** {_level_line(self.support, self.price, above=False)}"]
         if self.price is not None:
@@ -222,15 +244,86 @@ class EventAlert:
 
         blocks.append(f"📌 **信号类型** 事件（{'公布前' if self.stage == 'pre' else '公布后'}）")
         if self.stage == "pre":
-            blocks.append(f"📈 **市场预期** {self.forecast_text or '数据源未提供'}"
-                          f"　｜　📉 **前值** {self.previous_text or '数据源未提供'}")
+            # 数据源没给的字段直接不展示（不拿「数据源未提供」占位刷屏）
+            pre_nums = []
+            if self.forecast_text and self.forecast_text != "数据源未提供预期值":
+                pre_nums.append(f"📈 **市场预期** {self.forecast_text}")
+            if self.previous_text and self.previous_text != "数据源未提供前值":
+                pre_nums.append(f"📉 **前值** {self.previous_text}")
+            if pre_nums:
+                blocks.append("　｜　".join(pre_nums))
 
-        blocks.append("---")
-        blocks.append(self.body)
+        if self.body:
+            blocks.append("---")
+            blocks.append("### 📝 规则文案" if self.rule_text else "### 🤖 AI 思考")
+            blocks.append(self.body)
 
         if self.extra_lines:
             blocks.extend(md_bullet(line) for line in self.extra_lines)
 
+        blocks.append("---")
+        blocks.append(f"> 【风险提示】{self.disclaimer}")
+        return "\n\n".join(blocks)
+
+
+@dataclass
+class WorldAlert:
+    """国际大事推送（战争 / 技术突破 / 新法案 / 央行意外等）。
+
+    与事件轨同样的硬规矩：
+      - 必须带明确的【偏多 / 偏空】方向（研判逻辑给不出方向就根本不推）；
+      - 事实只来自抓取到的标题/摘要，大模型只做翻译与归因，不许补数字；
+      - 动作话术固定为「建议人工查看/等待确认」。
+    """
+
+    happened: str                # 中文一句话发生了什么（LLM 摘要，经数字校验）
+    category: str                # war / oil_supply / policy_trade / cb_ease / ...
+    verdict: str                 # 偏多 / 偏空
+    verdict_chain: str           # 一句传导链
+    body: str                    # 影响与历史规律（大白话）
+    source: str                  # 来源媒体
+    url: str                     # 原文链接
+    published_text: str          # 原文发布时间（北京时间字符串）
+    symbol: str = ""
+    short_name: str = ""
+    price: float | None = None
+    action_text: str = ""
+    disclaimer: str = ""
+    signal_type: str = SIGNAL_WORLD
+    # 大模型对这则新闻「现状 / 判断 / 在意什么」的简短思考（经数字校验，脏了只丢这一段）
+    thinking: str = ""
+    # True = 本条是大模型不可用时的确定性兜底文案（标题随之改口径）
+    rule_text: bool = False
+
+    # 面板标注用：品种标识 + 数据时间（取推送时刻真实现价的时间）
+    inst_id: str = ""
+    ts_ms: int | None = None
+
+    def title(self) -> str:
+        short = self.short_name or self.symbol or "国际"
+        return f"【{short}】国际大事：{self.verdict}"
+
+    def render(self) -> str:
+        short = self.short_name or self.symbol or "国际"
+        blocks: list[str] = [
+            f"## 【{short}】国际大事",
+            f"**{self.happened}**",
+            f"🎯 **方向研判：{self.verdict}**",
+            self.verdict_chain,
+        ]
+        if self.price is not None:
+            blocks.append(f"📊 **研判时现价** {fmt_num(self.price)}（仅作记录，非触发价）")
+        blocks.append(f"🕒 {self.published_text}　｜　📰 来源：{self.source}")
+
+        blocks.append("---")
+        blocks.append("### ⚠️ 当下该做什么")
+        blocks.append(f"**{self.action_text}**")
+        blocks.append("📌 **信号类型** 国际大事（事件冲击研判，不是经济日历数据）")
+
+        blocks.append("---")
+        blocks.append("### 📝 规则文案" if self.rule_text else "### 🤖 AI 思考")
+        blocks.append(self.thinking or self.body)
+        blocks.append(f"🔗 原文：{self.url}")
         blocks.append("---")
         blocks.append(f"> 【风险提示】{self.disclaimer}")
         return "\n\n".join(blocks)

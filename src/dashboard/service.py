@@ -12,7 +12,9 @@
 趋势状态怎么拿：直接读 `StateStore` 里监控进程写好的记录，**不重算 evaluate_trend**。
   重算会引入 LLM/推送链路，而面板的定位是「只读展示」，不该有副作用。
 
-红线：本模块只有 GET 语义的只读操作，不接交易接口、不下单、不发推送、不调大模型。
+控制页（/api/control）：本地控制台唯一允许写的地方，只改运行期的监控与推送偏好
+  （品种开关 / 免打扰 / 重点提醒 / 持仓覆盖），写进 state/control.json。
+  仍然不接交易接口、不下单、不发推送、不调大模型。
 """
 
 from __future__ import annotations
@@ -20,10 +22,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime
 from typing import Any, Callable
 
 from ..config import Config
+from ..control import ControlError, ControlStore
 from ..dashboard.history import AlertHistory, AlertRecord, bar_ms, ms_to_bj
+from ..datasource.econ_calendar import BEIJING
 from ..datasource.okx import Candle, HttpError, OkxClient
 from ..datasource.us_stock import UsStockClient
 from ..modules.levels import derive_levels
@@ -67,6 +72,11 @@ class DashboardService:
         )
         self.state = state_store or StateStore(
             cfg.resolve_path(str(app.get("state_file", "state/state.json")))
+        )
+        # 运行期控制项：控制页读写它；监控进程每轮重读，改完即刻生效
+        self.control = ControlStore(
+            cfg.resolve_path(str(app.get("control_file", "state/control.json"))),
+            valid_inst_ids=[str(s.get("inst_id")) for s in cfg.symbols],
         )
         # 周K一周才收一根，沿用监控进程的缓存口径，避免面板反复拉 Yahoo/OKX
         self.weekly_ttl_seconds = float(market.get("weekly_cache_minutes", 30)) * 60.0
@@ -115,7 +125,10 @@ class DashboardService:
     # 品种
     # ------------------------------------------------------------
     def symbols(self) -> list[dict[str, Any]]:
-        """全部品种（含已停用的，前端灰显但仍可看 K 线）。"""
+        """全部品种（含已停用的，前端灰显但仍可看 K 线）。
+
+        enabled 展示的是「生效值」：控制页开过关就按控制台，否则按 config。
+        """
         out: list[dict[str, Any]] = []
         for symbol in self.cfg.symbols:
             inst_id = str(symbol.get("inst_id") or "")
@@ -123,11 +136,16 @@ class DashboardService:
                 continue
             name = str(symbol.get("name") or inst_id)
             source = str(symbol.get("history_source") or "okx")
+            override = self.control.symbol_override(inst_id)
+            config_enabled = bool(symbol.get("enabled", True))
             out.append({
                 "inst_id": inst_id,
                 "name": name,
                 "short_name": short_symbol(inst_id, name),
-                "enabled": bool(symbol.get("enabled", True)),
+                "enabled": self._effective_enabled(symbol),
+                "config_enabled": config_enabled,
+                "override": override,
+                "priority": inst_id in self.control.priority_symbols(),
                 "inst_type": str(symbol.get("inst_type") or ""),
                 "history_source": source,
                 "source_desc": self._source_desc(symbol),
@@ -285,11 +303,15 @@ class DashboardService:
         if price is not None and open_24h:
             change_pct = round((float(price) - float(open_24h)) / float(open_24h) * 100.0, 2)
 
+        position, position_source = self._position_for(symbol)
+
         return {
             "inst_id": inst_id,
             "name": symbol.get("name"),
             "short_name": short_symbol(inst_id, str(symbol.get("name") or "")),
-            "enabled": bool(symbol.get("enabled", True)),
+            "enabled": self._effective_enabled(symbol),
+            "position": position,
+            "position_source": position_source,
             "price": price,
             "ts_ms": ticker["ts_ms"] if ticker else None,
             "ts_text": ticker["ts_text"] if ticker else "",
@@ -329,9 +351,98 @@ class DashboardService:
             "signal_type": record.signal_type,
             "title": record.title,
             "what_happened": record.what_happened,
+            "body": record.body,
             "price": record.price,
             "support": record.support,
             "resistance": record.resistance,
             "source": record.source,
             "source_label": "日志回填" if record.source == "log_backfill" else "实时",
         }
+
+    # ------------------------------------------------------------
+    # 控制项（本地控制台：读 + 写运行期偏好）
+    # ------------------------------------------------------------
+    def _effective_enabled(self, symbol: dict[str, Any]) -> bool:
+        """生效的开关：控制台覆盖优先，否则用 config 里的设定。"""
+        inst_id = str(symbol.get("inst_id") or "")
+        override = self.control.symbol_override(inst_id) if inst_id else None
+        return bool(symbol.get("enabled", True)) if override is None else bool(override)
+
+    def _position_for(self, symbol: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        """返回 (持仓视图, 来源)。来源：override=控制台填的 / config=配置里的 / none=无。"""
+        inst_id = str(symbol.get("inst_id") or "")
+        override = self.control.position(inst_id) if inst_id else None
+        if override is not None:
+            return self._position_view(override), "override"
+        cfg_pos = symbol.get("position") or {}
+        if cfg_pos.get("entry_price") is None:
+            return None, "none"
+        return self._position_view(cfg_pos), "config"
+
+    @staticmethod
+    def _position_view(raw: dict[str, Any]) -> dict[str, Any]:
+        def num(value: Any) -> Any:
+            return None if value is None else value
+
+        return {
+            "side": (str(raw.get("side")) if raw.get("side") else None),
+            "entry_price": num(raw.get("entry_price")),
+            "margin_usdt": num(raw.get("margin_usdt")),
+            "leverage": num(raw.get("leverage")),
+            "note": str(raw.get("note") or ""),
+        }
+
+    def control_snapshot(self) -> dict[str, Any]:
+        """控制页需要的全部内容（会在返回前重读 control.json，保证所见即最新）。"""
+        self.control.reload()
+        symbols_out: list[dict[str, Any]] = []
+        for symbol in self.cfg.symbols:
+            inst_id = str(symbol.get("inst_id") or "")
+            if not inst_id:
+                continue
+            name = str(symbol.get("name") or inst_id)
+            position, position_source = self._position_for(symbol)
+            override = self.control.symbol_override(inst_id)
+            symbols_out.append({
+                "inst_id": inst_id,
+                "name": name,
+                "short_name": short_symbol(inst_id, name),
+                "enabled": self._effective_enabled(symbol),
+                "config_enabled": bool(symbol.get("enabled", True)),
+                "override": override,
+                "priority": inst_id in self.control.priority_symbols(),
+                "position": position,
+                "position_source": position_source,
+            })
+        raw = self.control.snapshot()
+        dnd = raw.get("dnd") or {}
+        return {
+            "symbols": symbols_out,
+            "dnd": {
+                "enabled": bool(dnd.get("enabled")),
+                "windows": dnd.get("windows") or [],
+                "active_now": self.control.is_dnd_active(datetime.now(BEIJING)),
+            },
+            "priority": {
+                "symbols": self.control.priority_symbols(),
+                "tracks": self.control.priority_tracks(),
+            },
+            "tracks": self.control.valid_tracks(),
+            "updated_at": datetime.now(BEIJING).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def set_symbol_enabled(self, inst_id: Any, enabled: Any) -> dict[str, Any]:
+        self.control.set_symbol_enabled(str(inst_id or ""), enabled)
+        return self.control_snapshot()
+
+    def set_dnd(self, enabled: Any, windows: Any) -> dict[str, Any]:
+        self.control.set_dnd(enabled, windows)
+        return self.control_snapshot()
+
+    def set_priority(self, symbols: Any, tracks: Any) -> dict[str, Any]:
+        self.control.set_priority(symbols, tracks)
+        return self.control_snapshot()
+
+    def set_position(self, inst_id: Any, payload: dict[str, Any]) -> dict[str, Any]:
+        self.control.set_position(str(inst_id or ""), payload)
+        return self.control_snapshot()
